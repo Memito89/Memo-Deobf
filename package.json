@@ -1,14 +1,13 @@
 {
   "name": "lua-deobf-bot",
-  "version": "1.0.0",
-  "description": "Lua/Luau source resolver and analyzer",
+  "version": "2.0.0",
+  "description": "Static Lua/Luau deobfuscation study bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1"
+    "express": "^4.21.2"
   }
 }
