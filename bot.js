@@ -3,8 +3,7 @@ const {
   GatewayIntentBits,
   REST,
   Routes,
-  SlashCommandBuilder,
-  EmbedBuilder
+  SlashCommandBuilder
 } = require("discord.js");
 
 const TOKEN = process.env.DISCORD_TOKEN;
@@ -12,9 +11,7 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
 if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error(
-    "Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID Railway variable."
-  );
+  console.error("Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID.");
   process.exit(1);
 }
 
@@ -25,11 +22,11 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName("deobf")
-    .setDescription("Analyze Lua/Luau source code")
+    .setDescription("Analyze Lua/Luau source")
     .addStringOption(option =>
       option
         .setName("source")
-        .setDescription("Paste Lua/Luau source code")
+        .setDescription("Paste Lua/Luau source")
         .setRequired(false)
     )
     .addAttachmentOption(option =>
@@ -37,6 +34,16 @@ const commands = [
         .setName("file")
         .setDescription("Upload a Lua/Luau file")
         .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
+    .setName("loadstring")
+    .setDescription("Fetch a raw Lua source URL")
+    .addStringOption(option =>
+      option
+        .setName("url")
+        .setDescription("Raw HTTP/HTTPS Lua source URL")
+        .setRequired(true)
     ),
 
   new SlashCommandBuilder()
@@ -55,12 +62,6 @@ async function registerCommands() {
   console.log("Slash commands registered.");
 }
 
-/*
- * Extract URLs from Lua source.
- *
- * This only extracts them.
- * It does NOT request, execute, or download them.
- */
 function extractUrls(source) {
   const urls = new Set();
 
@@ -73,120 +74,145 @@ function extractUrls(source) {
   return [...urls];
 }
 
-/*
- * Find common loadstring/HttpGet patterns.
- */
 function findLoadStrings(source) {
   const results = [];
 
-  const patterns = [
-    /loadstring\s*\(\s*game\s*:\s*HttpGet\s*\(\s*["']([^"']+)["']/gi,
-    /loadstring\s*\(\s*game\s*\.\s*HttpGet\s*\(\s*["']([^"']+)["']/gi,
-    /loadstring\s*\(\s*http_request\s*\(\s*["']([^"']+)["']/gi,
-    /loadstring\s*\(\s*request\s*\(\s*["']([^"']+)["']/gi
-  ];
+  const regex =
+    /loadstring\s*\(\s*(?:game\s*:\s*)?HttpGet\s*\(\s*["']([^"']+)["']/gi;
 
-  for (const regex of patterns) {
-    for (const match of source.matchAll(regex)) {
-      results.push(match[1]);
-    }
+  for (const match of source.matchAll(regex)) {
+    results.push(match[1]);
   }
 
   return [...new Set(results)];
 }
 
 function analyzeLua(source) {
-  const urls = extractUrls(source);
-  const loadStrings = findLoadStrings(source);
-
   const patterns = [];
 
-  if (/\bloadstring\s*\(/i.test(source)) {
+  if (/\bloadstring\s*\(/i.test(source))
     patterns.push("loadstring");
-  }
 
-  if (/\bHttpGet\s*\(/i.test(source)) {
+  if (/\bHttpGet\s*\(/i.test(source))
     patterns.push("HttpGet");
-  }
 
-  if (/\bstring\.char\s*\(/i.test(source)) {
+  if (/\bstring\.char\s*\(/i.test(source))
     patterns.push("string.char");
-  }
 
-  if (/\bstring\.byte\s*\(/i.test(source)) {
+  if (/\bstring\.byte\s*\(/i.test(source))
     patterns.push("string.byte");
-  }
 
-  if (/\bbit32\./i.test(source)) {
-    patterns.push("bit32 operations");
-  }
-
-  if (/\bdebug\./i.test(source)) {
-    patterns.push("debug library");
-  }
-
-  if (/\bsetmetatable\s*\(/i.test(source)) {
-    patterns.push("metatable usage");
-  }
-
-  if (/\bgetmetatable\s*\(/i.test(source)) {
-    patterns.push("metatable access");
-  }
-
-  if (/\btable\.concat\s*\(/i.test(source)) {
-    patterns.push("table concatenation");
-  }
+  if (/\bsetmetatable\s*\(/i.test(source))
+    patterns.push("setmetatable");
 
   return {
     lines: source.split(/\r?\n/).length,
     characters: source.length,
     functions: (source.match(/\bfunction\b/g) || []).length,
     patterns,
-    urls,
-    loadStrings
+    urls: extractUrls(source),
+    loadStrings: findLoadStrings(source)
   };
 }
 
-function formatAnalysis(result) {
-  let output = "";
+/*
+ * Only fetches HTTP/HTTPS source.
+ * Never executes the returned Lua.
+ */
+async function fetchRawSource(url) {
+  let parsed;
 
-  output += "## Lua Analysis\n\n";
-
-  output += `**Lines:** ${result.lines}\n`;
-  output += `**Characters:** ${result.characters}\n`;
-  output += `**Functions:** ${result.functions}\n\n`;
-
-  output += "### Detected patterns\n";
-
-  if (result.patterns.length) {
-    for (const pattern of result.patterns) {
-      output += `- \`${pattern}\`\n`;
-    }
-  } else {
-    output += "- None detected\n";
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Invalid URL.");
   }
 
-  output += "\n### Extracted loadstring URLs\n";
-
-  if (result.loadStrings.length) {
-    for (const url of result.loadStrings) {
-      output += `- ${url}\n`;
-    }
-  } else {
-    output += "- None found\n";
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error("Only HTTP and HTTPS URLs are allowed.");
   }
 
-  output += "\n### Other URLs\n";
-
-  if (result.urls.length) {
-    for (const url of result.urls) {
-      output += `- ${url}\n`;
+  const response = await fetch(parsed.href, {
+    redirect: "follow",
+    headers: {
+      "User-Agent": "Lua-Study-Analyzer/1.0"
     }
-  } else {
-    output += "- None found\n";
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} ${response.statusText}`
+    );
   }
 
-  return output;
+  const text = await response.text();
+
+  if (text.length > 2_000_000) {
+    throw new Error("Remote source is larger than 2 MB.");
+  }
+
+  return text;
+}
+
+async function handleLoadstring(interaction, url) {
+  await interaction.deferReply();
+
+  try {
+    const source = await fetchRawSource(url);
+    const analysis = analyzeLua(source);
+
+    let output =
+      `## Raw Source\n` +
+      `**URL:** ${url}\n` +
+      `**Size:** ${source.length} characters\n\n`;
+
+    /*
+     * Discord messages cannot contain unlimited source.
+     * Show the first 3500 characters in a code block.
+     */
+    const preview = source.slice(0, 3500);
+
+    output += "```lua\n";
+    output += preview;
+    output += "\n```";
+
+    if (source.length > 3500) {
+      output +=
+        `\n\n⚠️ Showing first 3500 characters of ` +
+        `${source.length} total characters.`;
+    }
+
+    output += "\n\n### Detected patterns\n";
+
+    if (analysis.patterns.length) {
+      output += analysis.patterns
+        .map(x => `- \`${x}\``)
+        .join("\n");
+    } else {
+      output += "- None detected";
+    }
+
+    output += "\n\n### Nested loadstring URLs\n";
+
+    if (analysis.loadStrings.length) {
+      output += analysis.loadStrings
+        .map(x => `- ${x}`)
+        .join("\n");
+    } else {
+      output += "- None found";
+    }
+
+    await interaction.editReply({
+      content: output
+    });
+
+  } catch (error) {
+    console.error(error);
+
+    await interaction.editReply(
+      `❌ Could not fetch the source:\n\`${error.message}\``
+    );
+  }
 }
 
 client.once("ready", async () => {
@@ -195,8 +221,7 @@ client.once("ready", async () => {
   try {
     await registerCommands();
   } catch (error) {
-    console.error("Command registration failed:");
-    console.error(error);
+    console.error("Command registration failed:", error);
   }
 });
 
@@ -208,100 +233,76 @@ client.on("interactionCreate", async interaction => {
     return;
   }
 
-  if (interaction.commandName !== "deobf") return;
+  if (interaction.commandName === "loadstring") {
+    const url = interaction.options.getString("url");
 
-  const source = interaction.options.getString("source");
-  const file = interaction.options.getAttachment("file");
-
-  if (!source && !file) {
-    await interaction.reply({
-      content:
-        "❌ Provide either `source` or a Lua/Luau file.",
-      ephemeral: true
-    });
+    await handleLoadstring(interaction, url);
     return;
   }
 
-  await interaction.deferReply();
+  if (interaction.commandName === "deobf") {
+    const source =
+      interaction.options.getString("source");
 
-  try {
-    let luaSource = source;
+    const file =
+      interaction.options.getAttachment("file");
 
-    if (!luaSource && file) {
-      const allowed = [
-        ".lua",
-        ".luau",
-        ".txt"
-      ];
-
-      const filename = file.name.toLowerCase();
-
-      if (!allowed.some(ext => filename.endsWith(ext))) {
-        await interaction.editReply(
-          "❌ Upload a `.lua`, `.luau`, or `.txt` file."
-        );
-        return;
-      }
-
-      const response = await fetch(file.url);
-
-      if (!response.ok) {
-        throw new Error("Could not read the Discord attachment.");
-      }
-
-      luaSource = await response.text();
-    }
-
-    if (!luaSource || !luaSource.trim()) {
-      await interaction.editReply("❌ No Lua source was provided.");
+    if (!source && !file) {
+      await interaction.reply({
+        content:
+          "❌ Provide Lua source or upload a `.lua`/`.luau` file.",
+        ephemeral: true
+      });
       return;
     }
 
-    // Prevent accidentally processing enormous pasted input.
-    if (luaSource.length > 2_000_000) {
+    await interaction.deferReply();
+
+    try {
+      let luaSource = source;
+
+      if (!luaSource && file) {
+        const response = await fetch(file.url);
+
+        if (!response.ok) {
+          throw new Error("Could not download Discord attachment.");
+        }
+
+        luaSource = await response.text();
+      }
+
+      const analysis = analyzeLua(luaSource);
+
+      let output =
+        `## Lua Analysis\n\n` +
+        `**Lines:** ${analysis.lines}\n` +
+        `**Characters:** ${analysis.characters}\n` +
+        `**Functions:** ${analysis.functions}\n\n`;
+
+      output += "### Detected patterns\n";
+
+      output += analysis.patterns.length
+        ? analysis.patterns.map(x => `- \`${x}\``).join("\n")
+        : "- None detected";
+
+      output += "\n\n### Loadstring URLs\n";
+
+      output += analysis.loadStrings.length
+        ? analysis.loadStrings.map(x => `- ${x}`).join("\n")
+        : "- None found";
+
+      output += "\n\nUse `/loadstring url:<URL>` to fetch a source URL.";
+
+      await interaction.editReply(output);
+
+    } catch (error) {
+      console.error(error);
+
       await interaction.editReply(
-        "❌ Source is too large. Maximum is 2 MB."
+        `❌ Analysis failed: ${error.message}`
       );
-      return;
     }
-
-    const result = analyzeLua(luaSource);
-    const report = formatAnalysis(result);
-
-    if (report.length <= 1900) {
-      await interaction.editReply(report);
-    } else {
-      const chunks = [];
-
-      for (let i = 0; i < report.length; i += 1800) {
-        chunks.push(report.slice(i, i + 1800));
-      }
-
-      await interaction.editReply(chunks[0]);
-
-      for (let i = 1; i < chunks.length; i++) {
-        await interaction.followUp(chunks[i]);
-      }
-    }
-
-    console.log(
-      `Analyzed Lua from ${interaction.user.tag}`
-    );
-  } catch (error) {
-    console.error(error);
-
-    await interaction.editReply(
-      "❌ Analysis failed. Check the Railway logs."
-    );
   }
-});
-
-client.on("error", error => {
-  console.error("Discord error:", error);
-});
-
-process.on("unhandledRejection", error => {
-  console.error("Unhandled rejection:", error);
 });
 
 client.login(TOKEN);
