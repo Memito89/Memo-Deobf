@@ -1,5 +1,4 @@
 const express = require("express");
-const multer = require("multer");
 const crypto = require("crypto");
 
 const {
@@ -10,61 +9,101 @@ const {
   SlashCommandBuilder
 } = require("discord.js");
 
+/*
+===========================================================
+CONFIG
+===========================================================
+*/
+
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
+
+const PORT = process.env.PORT || 3000;
+
+const MAX_SOURCE_SIZE = 2 * 1024 * 1024;
+const MAX_FETCH_DEPTH = 5;
+const RAW_LIFETIME = 60 * 60 * 1000;
 
 if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
   console.error(
     "Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID."
   );
+
   process.exit(1);
 }
 
 /*
- * ---------------------------------------------------------
- * WEB SERVER
- * ---------------------------------------------------------
- */
+===========================================================
+RAW SOURCE SERVER
+===========================================================
+*/
 
 const app = express();
 
-const rawFiles = new Map();
+const rawStore = new Map();
 
 app.get("/", (req, res) => {
-  res.send("Lua source service online.");
+  res.type("text").send(
+    "Lua static analysis service is online."
+  );
 });
 
-/*
- * Returns uploaded source as plain text.
- *
- * Example:
- * https://your-project.up.railway.app/raw/abc123
- */
 app.get("/raw/:id", (req, res) => {
-  const source = rawFiles.get(req.params.id);
+  const entry = rawStore.get(req.params.id);
 
-  if (!source) {
-    return res.status(404).send("Source not found.");
+  if (!entry) {
+    return res.status(404).send(
+      "Source not found or expired."
+    );
   }
 
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.setHeader("Cache-Control", "no-store");
+  res.setHeader(
+    "Content-Type",
+    "text/plain; charset=utf-8"
+  );
 
-  res.send(source);
+  res.setHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+  res.send(entry.source);
 });
 
-const upload = multer({
-  limits: {
-    fileSize: 2 * 1024 * 1024
-  }
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(
+    `HTTP server listening on port ${PORT}`
+  );
 });
+
+function publishRaw(source, filename = "deobfuscated.lua") {
+  const id = crypto
+    .randomBytes(16)
+    .toString("hex");
+
+  rawStore.set(id, {
+    source,
+    filename,
+    created: Date.now()
+  });
+
+  setTimeout(() => {
+    rawStore.delete(id);
+  }, RAW_LIFETIME);
+
+  const base =
+    process.env.PUBLIC_URL ||
+    `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+
+  return `${base}/raw/${id}`;
+}
 
 /*
- * ---------------------------------------------------------
- * DISCORD
- * ---------------------------------------------------------
- */
+===========================================================
+DISCORD
+===========================================================
+*/
 
 const client = new Client({
   intents: [
@@ -75,33 +114,37 @@ const client = new Client({
 const commands = [
   new SlashCommandBuilder()
     .setName("deobf")
-    .setDescription("Resolve and analyze Lua/Luau source")
+    .setDescription(
+      "Statically deobfuscate/analyze Lua or Luau"
+    )
     .addStringOption(option =>
       option
         .setName("input")
         .setDescription(
-          "Lua source, loadstring, or raw HTTP/HTTPS URL"
+          "Lua source, loadstring, or raw URL"
         )
         .setRequired(false)
     )
     .addAttachmentOption(option =>
       option
         .setName("file")
-        .setDescription("Upload a Lua/Luau file")
+        .setDescription(
+          "Lua/Luau source file"
+        )
         .setRequired(false)
     ),
 
   new SlashCommandBuilder()
     .setName("ping")
-    .setDescription("Check whether the bot is online")
+    .setDescription(
+      "Check whether the bot is online"
+    )
 ].map(command => command.toJSON());
 
 async function registerCommands() {
   const rest = new REST({
     version: "10"
   }).setToken(TOKEN);
-
-  console.log("Registering commands...");
 
   await rest.put(
     Routes.applicationGuildCommands(
@@ -113,44 +156,35 @@ async function registerCommands() {
     }
   );
 
-  console.log("Commands registered.");
+  console.log(
+    "Discord commands registered."
+  );
 }
 
 /*
- * ---------------------------------------------------------
- * SOURCE HELPERS
- * ---------------------------------------------------------
- */
+===========================================================
+URL / LOADSTRING RESOLUTION
+===========================================================
+*/
 
-/*
- * Extract HTTP/HTTPS URLs from arbitrary text.
- */
-function extractUrls(text) {
+function extractUrls(source) {
   const regex =
     /https?:\/\/[^\s"'`<>()$begin:math:display$$end:math:display${}]+/gi;
 
   return [
     ...new Set(
-      [...text.matchAll(regex)]
+      [...source.matchAll(regex)]
         .map(match =>
-          match[0].replace(/[.,;]+$/, "")
+          match[0].replace(
+            /[.,;]+$/,
+            ""
+          )
         )
     )
   ];
 }
 
-/*
- * Specifically detect common Roblox-style:
- *
- * loadstring(game:HttpGet("URL"))()
- *
- * Also accepts:
- *
- * loadstring(game.HttpGet("URL"))()
- */
-function extractLoadstringUrls(text) {
-  const urls = new Set();
-
+function extractLoadstringUrls(source) {
   const patterns = [
     /loadstring\s*\(\s*game\s*:\s*HttpGet\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]/gi,
 
@@ -159,8 +193,10 @@ function extractLoadstringUrls(text) {
     /loadstring\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]\s*\)/gi
   ];
 
+  const urls = new Set();
+
   for (const regex of patterns) {
-    for (const match of text.matchAll(regex)) {
+    for (const match of source.matchAll(regex)) {
       urls.add(match[1]);
     }
   }
@@ -168,30 +204,18 @@ function extractLoadstringUrls(text) {
   return [...urls];
 }
 
-/*
- * If the user enters:
- *
- * https://example.com/script.lua
- *
- * return that URL.
- *
- * If they enter:
- *
- * loadstring(game:HttpGet("https://..."))()
- *
- * return the URL inside it.
- */
-function resolveInput(input) {
-  const loadstringUrls =
+function resolveURL(input) {
+  const loadstrings =
     extractLoadstringUrls(input);
 
-  if (loadstringUrls.length > 0) {
-    return loadstringUrls[0];
+  if (loadstrings.length) {
+    return loadstrings[0];
   }
 
-  const urls = extractUrls(input);
+  const urls =
+    extractUrls(input);
 
-  if (urls.length > 0) {
+  if (urls.length) {
     return urls[0];
   }
 
@@ -199,10 +223,10 @@ function resolveInput(input) {
 }
 
 /*
- * ---------------------------------------------------------
- * REMOTE SOURCE FETCHING
- * ---------------------------------------------------------
- */
+===========================================================
+REMOTE FETCH
+===========================================================
+*/
 
 async function fetchSource(url) {
   let parsed;
@@ -210,37 +234,46 @@ async function fetchSource(url) {
   try {
     parsed = new URL(url);
   } catch {
-    throw new Error("Invalid URL.");
+    throw new Error(
+      "Invalid URL."
+    );
   }
 
   if (
-    parsed.protocol !== "https:" &&
-    parsed.protocol !== "http:"
+    parsed.protocol !== "http:" &&
+    parsed.protocol !== "https:"
   ) {
     throw new Error(
-      "Only HTTP/HTTPS URLs are supported."
+      "Only HTTP/HTTPS URLs are allowed."
     );
   }
 
-  const response = await fetch(parsed.href, {
-    redirect: "follow",
-    headers: {
-      "User-Agent":
-        "Lua-Study-Bot/1.0"
+  const response = await fetch(
+    parsed.href,
+    {
+      redirect: "follow",
+      headers: {
+        "User-Agent":
+          "Lua-Static-Analyzer/2.0"
+      }
     }
-  });
+  );
 
   if (!response.ok) {
     throw new Error(
-      `Remote server returned HTTP ${response.status}.`
+      `HTTP ${response.status}`
     );
   }
 
-  const source = await response.text();
+  const source =
+    await response.text();
 
-  if (source.length > 2_000_000) {
+  if (
+    source.length >
+    MAX_SOURCE_SIZE
+  ) {
     throw new Error(
-      "Remote source is larger than 2 MB."
+      "Source exceeds the 2 MB limit."
     );
   }
 
@@ -248,119 +281,699 @@ async function fetchSource(url) {
 }
 
 /*
- * ---------------------------------------------------------
- * RAW SOURCE PUBLISHER
- * ---------------------------------------------------------
- */
+===========================================================
+STATIC STRING DECODERS
+===========================================================
+*/
 
-function publishSource(source) {
-  const id =
-    crypto.randomBytes(12).toString("hex");
+/*
+Lua decimal escapes:
 
-  rawFiles.set(id, source);
+"\104\101\108\108\111"
+        ↓
+"hello"
+*/
 
-  /*
-   * Automatically remove after 1 hour.
-   */
-  setTimeout(() => {
-    rawFiles.delete(id);
-  }, 60 * 60 * 1000);
+function decodeDecimalEscapes(source) {
+  return source.replace(
+    /\\(\d{1,3})/g,
+    (full, digits) => {
+      const value =
+        Number(digits);
 
-  const base =
-    process.env.PUBLIC_URL ||
-    `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`;
+      if (
+        value >= 0 &&
+        value <= 255
+      ) {
+        return String.fromCharCode(
+          value
+        );
+      }
 
-  return `${base}/raw/${id}`;
+      return full;
+    }
+  );
 }
 
 /*
- * ---------------------------------------------------------
- * STATIC ANALYSIS
- * ---------------------------------------------------------
- */
+Lua hexadecimal escapes:
 
-function analyzeLua(source) {
-  const patterns = [];
+"\x68\x65\x6c\x6c\x6f"
+*/
 
-  if (/\bloadstring\s*\(/i.test(source))
-    patterns.push("loadstring");
+function decodeHexEscapes(source) {
+  return source.replace(
+    /\\x([0-9a-fA-F]{2})/g,
+    (full, hex) =>
+      String.fromCharCode(
+        parseInt(hex, 16)
+      )
+  );
+}
 
-  if (/\bHttpGet\s*\(/i.test(source))
-    patterns.push("HttpGet");
+/*
+Base64 detection.
+*/
 
-  if (/\bstring\.char\s*\(/i.test(source))
-    patterns.push("string.char");
+function looksLikeBase64(value) {
+  if (
+    typeof value !== "string" ||
+    value.length < 16
+  ) {
+    return false;
+  }
 
-  if (/\bstring\.byte\s*\(/i.test(source))
-    patterns.push("string.byte");
+  if (
+    value.length % 4 !== 0
+  ) {
+    return false;
+  }
 
-  if (/\bsetmetatable\s*\(/i.test(source))
-    patterns.push("setmetatable");
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(
+    value
+  );
+}
 
-  if (/\bgetmetatable\s*\(/i.test(source))
-    patterns.push("getmetatable");
+function decodeBase64Strings(source) {
+  return source.replace(
+    /(["'])([A-Za-z0-9+/]{16,}={0,2})\1/g,
+    (full, quote, value) => {
+      if (
+        !looksLikeBase64(value)
+      ) {
+        return full;
+      }
 
-  if (/\bbit32\./i.test(source))
-    patterns.push("bit32");
+      try {
+        const decoded =
+          Buffer.from(
+            value,
+            "base64"
+          ).toString("utf8");
+
+        if (
+          /[\x00-\x08\x0E-\x1F]/.test(
+            decoded
+          )
+        ) {
+          return full;
+        }
+
+        return (
+          quote +
+          decoded.replace(
+            new RegExp(
+              quote,
+              "g"
+            ),
+            "\\" + quote
+          ) +
+          quote
+        );
+      } catch {
+        return full;
+      }
+    }
+  );
+}
+
+/*
+===========================================================
+SIMPLE XOR STRING DECODER
+===========================================================
+*/
+
+/*
+Handles recognizable constructs such as:
+
+xor("abc", 42)
+
+when a static XOR function can be identified.
+
+This does NOT execute Lua.
+*/
+
+function xorBytes(value, key) {
+  let result = "";
+
+  for (
+    let i = 0;
+    i < value.length;
+    i++
+  ) {
+    result += String.fromCharCode(
+      value.charCodeAt(i) ^
+        key
+    );
+  }
+
+  return result;
+}
+
+function decodeSimpleXorCalls(source) {
+  return source.replace(
+    /\bxor\s*\(\s*["']([^"']+)["']\s*,\s*(\d{1,3})\s*\)/gi,
+    (full, value, keyText) => {
+      const key =
+        Number(keyText);
+
+      if (
+        key < 0 ||
+        key > 255
+      ) {
+        return full;
+      }
+
+      const decoded =
+        xorBytes(
+          value,
+          key
+        );
+
+      return JSON.stringify(
+        decoded
+      );
+    }
+  );
+}
+
+/*
+===========================================================
+CONSTANT FOLDING
+===========================================================
+*/
+
+/*
+Only handles simple arithmetic.
+
+Examples:
+
+1 + 2
+10 - 3
+4 * 5
+20 / 2
+
+No arbitrary Lua execution.
+*/
+
+function foldArithmetic(source) {
+  let previous;
+
+  do {
+    previous = source;
+
+    source = source.replace(
+      /(?<![\w.])(-?\d+(?:\.\d+)?)\s*([+\-*\/])\s*(-?\d+(?:\.\d+)?)(?![\w.])/g,
+      (full, aText, op, bText) => {
+        const a =
+          Number(aText);
+
+        const b =
+          Number(bText);
+
+        let result;
+
+        if (op === "+")
+          result = a + b;
+
+        if (op === "-")
+          result = a - b;
+
+        if (op === "*")
+          result = a * b;
+
+        if (op === "/") {
+          if (b === 0)
+            return full;
+
+          result = a / b;
+        }
+
+        if (
+          !Number.isFinite(
+            result
+          )
+        ) {
+          return full;
+        }
+
+        return String(result);
+      }
+    );
+  } while (
+    previous !== source
+  );
+
+  return source;
+}
+
+/*
+===========================================================
+STRING CONCATENATION
+===========================================================
+*/
+
+/*
+Turns:
+
+"hel" .. "lo"
+
+into:
+
+"hello"
+*/
+
+function foldStringConcats(source) {
+  let previous;
+
+  do {
+    previous = source;
+
+    source = source.replace(
+      /(["'])(.*?)\1\s*\.\.\s*(["'])(.*?)\3/g,
+      (full, q1, a, q2, b) => {
+        return JSON.stringify(
+          a + b
+        );
+      }
+    );
+  } while (
+    previous !== source
+  );
+
+  return source;
+}
+
+/*
+===========================================================
+COMMENT CLEANUP
+===========================================================
+*/
+
+function removeComments(source) {
+  source = source.replace(
+    /--\[\[[\s\S]*?\]\]/g,
+    ""
+  );
+
+  source = source.replace(
+    /--[^\r\n]*/g,
+    ""
+  );
+
+  return source;
+}
+
+/*
+===========================================================
+WHITESPACE CLEANUP
+===========================================================
+*/
+
+function normalizeWhitespace(source) {
+  return source
+    .split(/\r?\n/)
+    .map(line =>
+      line.trimEnd()
+    )
+    .join("\n")
+    .replace(
+      /\n{4,}/g,
+      "\n\n\n"
+    );
+}
+
+/*
+===========================================================
+VM / OBFUSCATION DETECTION
+===========================================================
+*/
+
+function detectProtection(source) {
+  const findings = [];
+
+  const checks = [
+    {
+      name:
+        "loadstring execution",
+      regex:
+        /\bloadstring\s*\(/
+    },
+
+    {
+      name:
+        "HTTP source loading",
+      regex:
+        /\bHttpGet\s*\(/
+    },
+
+    {
+      name:
+        "large numeric table",
+      regex:
+        /\{(?:\s*-?\d+\s*,?){30,}\s*\}/
+    },
+
+    {
+      name:
+        "large string table",
+      regex:
+        /\{(?:\s*["'][^"']*["']\s*,?){20,}\s*\}/
+    },
+
+    {
+      name:
+        "computed dispatch",
+      regex:
+        /\b(?:while|for)\b[\s\S]{0,500}\b(?:pc|opcode|op|instruction|dispatch)\b/i
+    },
+
+    {
+      name:
+        "VM-like opcode table",
+      regex:
+        /\b(?:opcode|opcodes|instructions|bytecode|vm)\b/i
+    },
+
+    {
+      name:
+        "metatable indirection",
+      regex:
+        /\b(?:setmetatable|getmetatable|__index|__newindex)\b/
+    },
+
+    {
+      name:
+        "debug/integrity checks",
+      regex:
+        /\bdebug\./
+    },
+
+    {
+      name:
+        "string byte operations",
+      regex:
+        /\bstring\.(?:byte|char|sub)\b/
+    },
+
+    {
+      name:
+        "bitwise operations",
+      regex:
+        /\b(?:bit32|bit)\./
+    },
+
+    {
+      name:
+        "control-flow flattening indicators",
+      regex:
+        /\b(?:state|state_id|dispatcher|next_state|pc)\b/i
+    }
+  ];
+
+  for (const check of checks) {
+    if (check.regex.test(source)) {
+      findings.push(
+        check.name
+      );
+    }
+  }
+
+  return findings;
+}
+
+/*
+===========================================================
+DEOBFUSCATION PASSES
+===========================================================
+*/
+
+function deobfuscate(source) {
+  let output = source;
+
+  const passes = [];
+
+  const before = output;
+
+  output =
+    decodeDecimalEscapes(
+      output
+    );
+
+  if (output !== before) {
+    passes.push(
+      "decimal escape decoding"
+    );
+  }
+
+  const beforeHex =
+    output;
+
+  output =
+    decodeHexEscapes(
+      output
+    );
+
+  if (output !== beforeHex) {
+    passes.push(
+      "hex escape decoding"
+    );
+  }
+
+  const beforeB64 =
+    output;
+
+  output =
+    decodeBase64Strings(
+      output
+    );
+
+  if (output !== beforeB64) {
+    passes.push(
+      "Base64 string decoding"
+    );
+  }
+
+  const beforeXor =
+    output;
+
+  output =
+    decodeSimpleXorCalls(
+      output
+    );
+
+  if (output !== beforeXor) {
+    passes.push(
+      "static XOR decoding"
+    );
+  }
+
+  const beforeMath =
+    output;
+
+  output =
+    foldArithmetic(
+      output
+    );
+
+  if (output !== beforeMath) {
+    passes.push(
+      "arithmetic constant folding"
+    );
+  }
+
+  const beforeConcat =
+    output;
+
+  output =
+    foldStringConcats(
+      output
+    );
+
+  if (output !== beforeConcat) {
+    passes.push(
+      "string concatenation folding"
+    );
+  }
+
+  const beforeComments =
+    output;
+
+  output =
+    removeComments(
+      output
+    );
+
+  if (output !== beforeComments) {
+    passes.push(
+      "comment removal"
+    );
+  }
+
+  output =
+    normalizeWhitespace(
+      output
+    );
 
   return {
+    source: output,
+    passes
+  };
+}
+
+/*
+===========================================================
+RECURSIVE SOURCE RESOLUTION
+===========================================================
+*/
+
+async function resolveSource(
+  initialSource,
+  depth = 0,
+  visited = new Set()
+) {
+  if (
+    depth > MAX_FETCH_DEPTH
+  ) {
+    return {
+      source: initialSource,
+      chain: [],
+      depthLimit: true
+    };
+  }
+
+  const url =
+    resolveURL(
+      initialSource
+    );
+
+  if (!url) {
+    return {
+      source: initialSource,
+      chain: []
+    };
+  }
+
+  if (
+    visited.has(url)
+  ) {
+    return {
+      source: initialSource,
+      chain: [url],
+      circular: true
+    };
+  }
+
+  visited.add(url);
+
+  const remote =
+    await fetchSource(url);
+
+  const nested =
+    await resolveSource(
+      remote,
+      depth + 1,
+      visited
+    );
+
+  return {
+    source:
+      nested.source,
+    chain: [
+      url,
+      ...nested.chain
+    ],
+    depthLimit:
+      nested.depthLimit,
+    circular:
+      nested.circular
+  };
+}
+
+/*
+===========================================================
+ANALYSIS
+===========================================================
+*/
+
+function analyze(source) {
+  return {
     lines:
-      source.split(/\r?\n/).length,
+      source.split(/\r?\n/)
+        .length,
 
     characters:
       source.length,
 
     functions:
-      (source.match(/\bfunction\b/g) || []).length,
-
-    patterns,
-
-    loadstringUrls:
-      extractLoadstringUrls(source),
+      (
+        source.match(
+          /\bfunction\b/g
+        ) || []
+      ).length,
 
     urls:
-      extractUrls(source)
+      extractUrls(source),
+
+    loadstrings:
+      extractLoadstringUrls(
+        source
+      ),
+
+    protection:
+      detectProtection(
+        source
+      )
   };
 }
 
 /*
- * ---------------------------------------------------------
- * DISCORD COMMAND
- * ---------------------------------------------------------
- */
+===========================================================
+DISCORD COMMAND HANDLER
+===========================================================
+*/
 
-client.once("ready", async () => {
-  console.log(
-    `Logged in as ${client.user.tag}`
-  );
-
-  try {
-    await registerCommands();
-  } catch (error) {
-    console.error(
-      "Command registration failed:",
-      error
+client.once(
+  "ready",
+  async () => {
+    console.log(
+      `Logged in as ${client.user.tag}`
     );
+
+    try {
+      await registerCommands();
+    } catch (error) {
+      console.error(
+        "Command registration failed:",
+        error
+      );
+    }
   }
-});
+);
 
 client.on(
   "interactionCreate",
   async interaction => {
-    if (!interaction.isChatInputCommand())
-      return;
-
     if (
-      interaction.commandName === "ping"
+      !interaction.isChatInputCommand()
     ) {
-      await interaction.reply(
-        "🏓 Pong!"
-      );
       return;
     }
 
     if (
-      interaction.commandName !== "deobf"
+      interaction.commandName ===
+      "ping"
+    ) {
+      await interaction.reply(
+        "🏓 Pong!"
+      );
+
+      return;
+    }
+
+    if (
+      interaction.commandName !==
+      "deobf"
     ) {
       return;
     }
@@ -370,15 +983,15 @@ client.on(
         "input"
       );
 
-    const file =
+    const attachment =
       interaction.options.getAttachment(
         "file"
       );
 
-    if (!input && !file) {
+    if (!input && !attachment) {
       await interaction.reply({
         content:
-          "❌ Provide Lua source, a loadstring/raw URL, or upload a Lua file.",
+          "Provide Lua source, a loadstring/raw URL, or a Lua file.",
         ephemeral: true
       });
 
@@ -388,34 +1001,37 @@ client.on(
     await interaction.deferReply();
 
     try {
-      let source = null;
-      let originalInput = null;
+      let originalSource;
+      let filename =
+        "deobfuscated.lua";
 
       /*
-       * FILE
-       */
-      if (file) {
-        const filename =
-          file.name.toLowerCase();
+      -----------------------------------------------
+      FILE
+      -----------------------------------------------
+      */
 
-        const allowed = [
-          ".lua",
-          ".luau",
-          ".txt"
-        ];
+      if (attachment) {
+        const name =
+          attachment.name.toLowerCase();
 
         if (
-          !allowed.some(ext =>
-            filename.endsWith(ext)
-          )
+          !name.endsWith(".lua") &&
+          !name.endsWith(".luau") &&
+          !name.endsWith(".txt")
         ) {
           throw new Error(
-            "Only .lua, .luau, or .txt files are supported."
+            "Only .lua, .luau, and .txt files are supported."
           );
         }
 
+        filename =
+          attachment.name;
+
         const response =
-          await fetch(file.url);
+          await fetch(
+            attachment.url
+          );
 
         if (!response.ok) {
           throw new Error(
@@ -423,112 +1039,122 @@ client.on(
           );
         }
 
-        source =
+        originalSource =
           await response.text();
-
-        originalInput =
-          `Uploaded file: ${file.name}`;
       }
 
       /*
-       * TEXT / LOADSTRING / URL
-       */
-      else if (input) {
-        const remoteUrl =
-          resolveInput(input);
+      -----------------------------------------------
+      TEXT / LOADSTRING / RAW URL
+      -----------------------------------------------
+      */
 
-        /*
-         * Raw URL or loadstring
-         */
-        if (remoteUrl) {
-          source =
-            await fetchSource(
-              remoteUrl
-            );
-
-          originalInput =
-            remoteUrl;
-        }
-
-        /*
-         * Plain Lua source
-         */
-        else {
-          source = input;
-
-          originalInput =
-            "Pasted Lua source";
-        }
-      }
-
-      if (!source) {
-        throw new Error(
-          "No source could be resolved."
-        );
+      else {
+        originalSource =
+          input;
       }
 
       if (
-        source.length >
-        2_000_000
+        originalSource.length >
+        MAX_SOURCE_SIZE
       ) {
         throw new Error(
-          "Source is larger than 2 MB."
+          "Input exceeds the 2 MB limit."
         );
       }
 
       /*
-       * Publish the resolved source.
-       */
-      const rawUrl =
-        publishSource(source);
+      -----------------------------------------------
+      RESOLVE REMOTE SOURCE
+      -----------------------------------------------
+      */
+
+      const resolved =
+        await resolveSource(
+          originalSource
+        );
 
       /*
-       * Analyze it.
-       */
+      -----------------------------------------------
+      DEOBFUSCATION
+      -----------------------------------------------
+      */
+
+      const result =
+        deobfuscate(
+          resolved.source
+        );
+
+      /*
+      -----------------------------------------------
+      ANALYSIS
+      -----------------------------------------------
+      */
+
       const analysis =
-        analyzeLua(source);
+        analyze(
+          result.source
+        );
+
+      /*
+      -----------------------------------------------
+      PUBLISH RESULT
+      -----------------------------------------------
+      */
+
+      const rawUrl =
+        publishRaw(
+          result.source,
+          filename
+        );
+
+      /*
+      -----------------------------------------------
+      RESPONSE
+      -----------------------------------------------
+      */
 
       let message =
-        "## ✅ Source Resolved\n\n";
+        "## ✅ Deobfuscation Complete\n\n";
 
       message +=
-        `**Input:** ${originalInput}\n`;
+        `**Input size:** ${originalSource.length.toLocaleString()} chars\n`;
 
       message +=
-        `**Size:** ${source.length.toLocaleString()} characters\n`;
+        `**Output size:** ${result.source.length.toLocaleString()} chars\n`;
 
       message +=
         `**Lines:** ${analysis.lines.toLocaleString()}\n\n`;
 
       message +=
-        `### 🔗 Raw Source\n${rawUrl}\n\n`;
+        `### 🔗 Raw output\n${rawUrl}\n\n`;
 
       message +=
-        "### 🔍 Detected\n";
+        "### 🔧 Passes applied\n";
 
       if (
-        analysis.patterns.length
+        result.passes.length
       ) {
         message +=
-          analysis.patterns
-            .map(x => `- \`${x}\``)
+          result.passes
+            .map(
+              pass =>
+                `- ${pass}`
+            )
             .join("\n");
       } else {
         message +=
-          "- No known patterns detected.";
+          "- No safe static transformations matched.";
       }
 
-      /*
-       * Show nested loadstring URLs.
-       */
       if (
-        analysis.loadstringUrls.length
+        resolved.chain.length
       ) {
         message +=
-          "\n\n### 🔗 Nested Loadstrings\n";
+          "\n\n### 🌐 Source chain\n";
 
         message +=
-          analysis.loadstringUrls
+          resolved.chain
             .map(
               url =>
                 `- ${url}`
@@ -536,13 +1162,45 @@ client.on(
             .join("\n");
       }
 
-      /*
-       * Keep Discord message under 2000.
-       */
-      if (message.length > 1900) {
+      if (
+        analysis.protection.length
+      ) {
+        message +=
+          "\n\n### 🔍 Remaining indicators\n";
+
+        message +=
+          analysis.protection
+            .map(
+              item =>
+                `- ${item}`
+            )
+            .join("\n");
+      }
+
+      if (
+        analysis.loadstrings.length
+      ) {
+        message +=
+          "\n\n### 🔗 Loadstrings found\n";
+
+        message +=
+          analysis.loadstrings
+            .map(
+              url =>
+                `- ${url}`
+            )
+            .join("\n");
+      }
+
+      if (
+        message.length > 1900
+      ) {
         message =
-          message.slice(0, 1800) +
-          "\n\n...more results available from the raw source.";
+          message.slice(
+            0,
+            1800
+          ) +
+          "\n\nSee the raw output URL for the complete result.";
       }
 
       await interaction.editReply(
@@ -550,7 +1208,10 @@ client.on(
       );
 
     } catch (error) {
-      console.error(error);
+      console.error(
+        "Deobfuscation error:",
+        error
+      );
 
       await interaction.editReply(
         `❌ **Failed:** ${error.message}`
@@ -579,23 +1240,6 @@ process.on(
   }
 );
 
-client.login(TOKEN);
-
-/*
- * ---------------------------------------------------------
- * START WEB SERVER
- * ---------------------------------------------------------
- */
-
-const PORT =
-  process.env.PORT || 3000;
-
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `Raw source server listening on ${PORT}`
-    );
-  }
+client.login(
+  TOKEN
 );
