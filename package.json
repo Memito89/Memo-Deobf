@@ -1,6 +1,7 @@
 {
   "name": "lua-deobf-bot",
   "version": "1.0.0",
+  "description": "Lua/Luau static analysis study bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
