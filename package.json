@@ -1,0 +1,13 @@
+{
+  "name": "lua-study-analyzer",
+  "version": "1.0.0",
+  "description": "Lua/Luau static analysis study tool",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}
