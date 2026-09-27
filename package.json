@@ -1,13 +1,11 @@
 {
-  "name": "lua-study-analyzer",
+  "name": "lua-deobf-bot",
   "version": "1.0.0",
-  "description": "Lua/Luau static analysis study tool",
-  "main": "server.js",
+  "main": "bot.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1"
+    "discord.js": "^14.16.3"
   }
 }
