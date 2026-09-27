@@ -1,3 +1,35 @@
+/*
+ * ============================================================
+ * Lua Static Deobfuscation / Source Recovery Bot
+ * ============================================================
+ *
+ * Railway environment variables:
+ *
+ * DISCORD_TOKEN=your_bot_token
+ * CLIENT_ID=your_application_id
+ * GUILD_ID=your_server_id
+ * PUBLIC_URL=https://your-project.up.railway.app
+ *
+ * Node.js 18+ recommended.
+ *
+ * Supported /deobf inputs:
+ *   - Lua/Luau source
+ *   - raw HTTP/HTTPS URL
+ *   - loadstring("https://...")
+ *   - game:HttpGet("https://...")
+ *   - uploaded .lua/.luau/.txt files
+ *
+ * Output:
+ *   Only a raw URL containing the recovered Lua source.
+ *
+ * This performs STATIC transformations only.
+ * It does not execute arbitrary Lua or attempt to unpack
+ * protected commercial VM obfuscators.
+ * ============================================================
+ */
+
+"use strict";
+
 const express = require("express");
 const crypto = require("crypto");
 
@@ -9,55 +41,72 @@ const {
   SlashCommandBuilder
 } = require("discord.js");
 
-/* =========================================================
+/* ============================================================
    CONFIG
-========================================================= */
+============================================================ */
 
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 const PUBLIC_URL = process.env.PUBLIC_URL;
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 const MAX_SOURCE_SIZE = 2 * 1024 * 1024;
 const MAX_FETCH_DEPTH = 5;
 const RAW_LIFETIME = 60 * 60 * 1000;
 
-if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
-  console.error(
-    "Missing DISCORD_TOKEN, CLIENT_ID, or GUILD_ID."
-  );
+if (!TOKEN) {
+  console.error("Missing DISCORD_TOKEN.");
+  process.exit(1);
+}
+
+if (!CLIENT_ID) {
+  console.error("Missing CLIENT_ID.");
+  process.exit(1);
+}
+
+if (!GUILD_ID) {
+  console.error("Missing GUILD_ID.");
   process.exit(1);
 }
 
 if (!PUBLIC_URL) {
   console.warn(
-    "WARNING: PUBLIC_URL is not configured."
+    "WARNING: PUBLIC_URL is missing. Raw output links will not work."
   );
 }
 
-/* =========================================================
-   WEB SERVER
-========================================================= */
+/* ============================================================
+   EXPRESS SERVER
+============================================================ */
 
 const app = express();
+
+app.disable("x-powered-by");
+
 const rawStore = new Map();
 
+/*
+ * Health endpoint.
+ */
 app.get("/", (req, res) => {
   res.type("text").send(
-    "Lua static analysis / sandbox dumper online."
+    "Lua static recovery bot online."
   );
 });
 
 app.get("/health", (req, res) => {
   res.json({
     online: true,
-    storedSources: rawStore.size,
-    mode: "static-analysis"
+    rawFiles: rawStore.size,
+    mode: "static"
   });
 });
 
+/*
+ * Raw source endpoint.
+ */
 app.get("/raw/:id", (req, res) => {
   const item = rawStore.get(req.params.id);
 
@@ -87,17 +136,17 @@ app.get("/raw/:id", (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP server listening on ${PORT}`);
+  console.log(`Web server listening on port ${PORT}`);
 });
 
-/* =========================================================
-   RAW HOSTING
-========================================================= */
+/* ============================================================
+   RAW SOURCE STORAGE
+============================================================ */
 
-function publishRaw(source, filename) {
+function publishRaw(source, filename = "recovered.lua") {
   if (!PUBLIC_URL) {
     throw new Error(
-      "PUBLIC_URL is missing from Railway Variables."
+      "PUBLIC_URL is not configured in Railway Variables."
     );
   }
 
@@ -116,15 +165,32 @@ function publishRaw(source, filename) {
   }, RAW_LIFETIME);
 
   return (
-    PUBLIC_URL.replace(/\/$/, "") +
+    PUBLIC_URL.replace(/\/+$/, "") +
     "/raw/" +
     id
   );
 }
 
-/* =========================================================
-   DISCORD
-========================================================= */
+/*
+ * Periodic cleanup in case the process remains alive
+ * for a long time.
+ */
+setInterval(() => {
+  const now = Date.now();
+
+  for (const [id, item] of rawStore) {
+    if (
+      now - item.created >
+      RAW_LIFETIME
+    ) {
+      rawStore.delete(id);
+    }
+  }
+}, 10 * 60 * 1000);
+
+/* ============================================================
+   DISCORD CLIENT
+============================================================ */
 
 const client = new Client({
   intents: [
@@ -132,17 +198,21 @@ const client = new Client({
   ]
 });
 
+/* ============================================================
+   SLASH COMMANDS
+============================================================ */
+
 const commands = [
   new SlashCommandBuilder()
     .setName("deobf")
     .setDescription(
-      "Analyze Lua/Luau source"
+      "Recover readable Lua from source, URL, loadstring, or file."
     )
     .addStringOption(option =>
       option
         .setName("input")
         .setDescription(
-          "Lua source, loadstring, or raw URL"
+          "Lua source, raw URL, or loadstring."
         )
         .setRequired(false)
     )
@@ -150,7 +220,7 @@ const commands = [
       option
         .setName("file")
         .setDescription(
-          "Upload .lua, .luau, or .txt"
+          "Upload a .lua, .luau, or .txt file."
         )
         .setRequired(false)
     ),
@@ -158,9 +228,9 @@ const commands = [
   new SlashCommandBuilder()
     .setName("ping")
     .setDescription(
-      "Check bot status"
+      "Check whether the bot is online."
     )
-].map(x => x.toJSON());
+].map(command => command.toJSON());
 
 async function registerCommands() {
   const rest = new REST({
@@ -177,26 +247,29 @@ async function registerCommands() {
     }
   );
 
-  console.log("Slash commands registered.");
+  console.log(
+    "Slash commands registered."
+  );
 }
 
-/* =========================================================
-   URL EXTRACTION
-========================================================= */
+/* ============================================================
+   URL HELPERS
+============================================================ */
 
 function extractUrls(source) {
-  const matches = source.match(
-    /https?:\/\/(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:\/[^\s"'`<>()$begin:math:display$$end:math:display${}]*)?/gi
-  );
+  const regex =
+    /https?:\/\/[^\s"'`<>()]+/gi;
 
-  if (!matches) {
-    return [];
-  }
+  const matches =
+    source.match(regex) || [];
 
   return [
     ...new Set(
-      matches.map(x =>
-        x.replace(/[.,;]+$/, "")
+      matches.map(url =>
+        url.replace(
+          /[),.;]+$/,
+          ""
+        )
       )
     )
   ];
@@ -205,181 +278,180 @@ function extractUrls(source) {
 function extractLoadstringUrls(source) {
   const urls = new Set();
 
-  const patterns = [
-    /loadstring\s*\(\s*game\s*:\s*HttpGet\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+  /*
+   * loadstring("https://...")
+   */
+  const directLoadstring =
+    /loadstring\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]\s*\)/gi;
 
-    /loadstring\s*\(\s*game\s*\.\s*HttpGet\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+  for (
+    const match of source.matchAll(
+      directLoadstring
+    )
+  ) {
+    urls.add(match[1]);
+  }
 
-    /loadstring\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]\s*\)/gi
-  ];
+  /*
+   * loadstring(game:HttpGet("https://..."))
+   */
+  const httpGet =
+    /loadstring\s*\(\s*game\s*:\s*HttpGet\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]\s*\)\s*\)/gi;
 
-  for (const regex of patterns) {
-    for (const match of source.matchAll(regex)) {
-      try {
-        const url = new URL(match[1]);
+  for (
+    const match of source.matchAll(
+      httpGet
+    )
+  ) {
+    urls.add(match[1]);
+  }
 
-        if (
-          url.protocol === "http:" ||
-          url.protocol === "https:"
-        ) {
-          urls.add(url.href);
-        }
-      } catch {
-        // Ignore invalid candidates.
-      }
-    }
+  /*
+   * game.HttpGet(...)
+   */
+  const dotHttpGet =
+    /(?:game|Game)\s*\.\s*HttpGet\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]\s*\)/gi;
+
+  for (
+    const match of source.matchAll(
+      dotHttpGet
+    )
+  ) {
+    urls.add(match[1]);
   }
 
   return [...urls];
 }
 
-function resolveInputURL(input) {
-  const loadstrings =
-    extractLoadstringUrls(input);
-
-  if (loadstrings.length) {
-    return loadstrings[0];
-  }
-
-  const trimmed = input.trim();
-
+function isHttpURL(value) {
   try {
-    const url = new URL(trimmed);
+    const url = new URL(value);
 
-    if (
+    return (
       url.protocol === "http:" ||
       url.protocol === "https:"
-    ) {
-      return url.href;
-    }
+    );
   } catch {
-    // Not a standalone URL.
+    return false;
+  }
+}
+
+function resolveStandaloneURL(input) {
+  const trimmed =
+    input.trim();
+
+  if (isHttpURL(trimmed)) {
+    return trimmed;
+  }
+
+  const loadstringURLs =
+    extractLoadstringUrls(
+      trimmed
+    );
+
+  if (loadstringURLs.length) {
+    return loadstringURLs[0];
   }
 
   return null;
 }
 
-/* =========================================================
-   FETCHER
-========================================================= */
+/* ============================================================
+   REMOTE FETCH
+============================================================ */
 
 async function fetchSource(url) {
-  console.log(`[FETCH] ${url}`);
-
-  let parsed;
-
-  try {
-    parsed = new URL(url);
-  } catch {
+  if (!isHttpURL(url)) {
     throw new Error(
-      `Invalid URL: ${url}`
+      "Only HTTP/HTTPS URLs are supported."
     );
   }
 
-  if (
-    parsed.protocol !== "http:" &&
-    parsed.protocol !== "https:"
-  ) {
-    throw new Error(
-      "Only HTTP and HTTPS URLs are supported."
-    );
-  }
+  console.log(
+    `[FETCH] ${url}`
+  );
+
+  let response;
 
   try {
-    const response = await fetch(
-      parsed.href,
+    response = await fetch(
+      url,
       {
         redirect: "follow",
         headers: {
           "User-Agent":
-            "LuaStaticAnalyzer/1.0",
+            "LuaStaticRecoveryBot/1.0",
           "Accept":
             "text/plain,text/*,*/*"
         },
         signal:
-          AbortSignal.timeout(30000)
+          AbortSignal.timeout(
+            30000
+          )
       }
     );
-
-    console.log(
-      `[HTTP] ${response.status} ${response.statusText}`
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status} ${response.statusText}`
-      );
-    }
-
-    const source =
-      await response.text();
-
-    if (!source.trim()) {
-      throw new Error(
-        "Remote source is empty."
-      );
-    }
-
-    if (
-      source.length >
-      MAX_SOURCE_SIZE
-    ) {
-      throw new Error(
-        "Remote source exceeds the 2 MB limit."
-      );
-    }
-
-    return source;
-
   } catch (error) {
-    console.error(
-      `[FETCH FAILED] ${parsed.href}`,
-      error
-    );
-
     throw new Error(
-      `Fetch failed for ${parsed.href}: ${error.message}`
+      `Fetch failed for ${url}: ${error.message}`
     );
   }
+
+  if (!response.ok) {
+    throw new Error(
+      `Fetch failed for ${url}: HTTP ${response.status}`
+    );
+  }
+
+  const source =
+    await response.text();
+
+  if (!source.trim()) {
+    throw new Error(
+      "Fetched source is empty."
+    );
+  }
+
+  if (
+    source.length >
+    MAX_SOURCE_SIZE
+  ) {
+    throw new Error(
+      "Fetched source exceeds the 2 MB limit."
+    );
+  }
+
+  return source;
 }
 
-/* =========================================================
-   LOADSTRING RESOLUTION
-========================================================= */
+/* ============================================================
+   NESTED SOURCE RESOLUTION
+============================================================ */
 
-async function resolveRecursive(
+async function resolveRemoteChain(
   source,
   depth = 0,
   visited = new Set()
 ) {
-  if (depth >= MAX_FETCH_DEPTH) {
-    return {
-      source,
-      chain: [],
-      stopped:
-        "maximum source depth reached"
-    };
+  if (
+    depth >=
+    MAX_FETCH_DEPTH
+  ) {
+    return source;
   }
 
   const urls =
-    extractLoadstringUrls(source);
+    extractLoadstringUrls(
+      source
+    );
 
   if (!urls.length) {
-    return {
-      source,
-      chain: []
-    };
+    return source;
   }
 
   const url = urls[0];
 
   if (visited.has(url)) {
-    return {
-      source,
-      chain: [url],
-      stopped:
-        "circular source detected"
-    };
+    return source;
   }
 
   visited.add(url);
@@ -387,402 +459,20 @@ async function resolveRecursive(
   const remote =
     await fetchSource(url);
 
-  const nested =
-    await resolveRecursive(
-      remote,
-      depth + 1,
-      visited
-    );
-
-  return {
-    source: nested.source,
-
-    chain: [
-      url,
-      ...nested.chain
-    ],
-
-    stopped: nested.stopped
-  };
+  return resolveRemoteChain(
+    remote,
+    depth + 1,
+    visited
+  );
 }
 
-/* =========================================================
-   STATIC STRING ANALYSIS
-========================================================= */
-
-function extractQuotedStrings(source) {
-  const results = [];
-  const regex =
-    /(["'`])((?:\\.|(?!\1)[\s\S])*?)\1/g;
-
-  for (const match of source.matchAll(regex)) {
-    const value = match[2];
-
-    if (value.length > 0) {
-      results.push(value);
-    }
-  }
-
-  return [
-    ...new Set(results)
-  ];
-}
-
-function extractNumbers(source) {
-  const results =
-    source.match(
-      /(?<![\w.])-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)/g
-    ) || [];
-
-  return [
-    ...new Set(results)
-  ];
-}
-
-function extractFunctionNames(source) {
-  const names = [];
-
-  const patterns = [
-    /\bfunction\s+([A-Za-z_][A-Za-z0-9_.:]*)/g,
-
-    /\blocal\s+function\s+([A-Za-z_][A-Za-z0-9_]*)/g,
-
-    /([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function\b/g
-  ];
-
-  for (const regex of patterns) {
-    for (const match of source.matchAll(regex)) {
-      names.push(match[1]);
-    }
-  }
-
-  return [
-    ...new Set(names)
-  ];
-}
-
-/* =========================================================
-   VM-STYLE STRUCTURE DETECTION
-========================================================= */
-
-function detectVMStructures(source) {
-  const findings = [];
-
-  const checks = [
-    [
-      "dispatcher",
-      /\b(?:dispatch|dispatcher|dispatch_table|dispatchTable)\b/i
-    ],
-
-    [
-      "opcode",
-      /\b(?:opcode|opcodes|OPCODE|OPCODES)\b/
-    ],
-
-    [
-      "program counter",
-      /\b(?:pc|PC|program_counter|instruction_pointer)\b/
-    ],
-
-    [
-      "instruction table",
-      /\b(?:instructions|instruction_table|instructionTable)\b/i
-    ],
-
-    [
-      "VM state",
-      /\b(?:vm|VM|vm_state|vmState|state_table)\b/
-    ],
-
-    [
-      "constant table",
-      /\b(?:constants|constant_table|consts|CONST)\b/i
-    ],
-
-    [
-      "prototype",
-      /\b(?:prototype|prototypes|proto|closure)\b/i
-    ],
-
-    [
-      "register",
-      /\b(?:register|registers|reg|regs)\b/i
-    ],
-
-    [
-      "jump/state machine",
-      /\b(?:next_state|jump_table|jump|state_id)\b/i
-    ],
-
-    [
-      "metatable",
-      /\b(?:setmetatable|getmetatable|__index|__newindex)\b/
-    ],
-
-    [
-      "bytecode",
-      /\b(?:bytecode|byte_code|bytecodes)\b/i
-    ]
-  ];
-
-  for (const [name, regex] of checks) {
-    if (regex.test(source)) {
-      findings.push(name);
-    }
-  }
-
-  return findings;
-}
-
-/* =========================================================
-   ROBLOX-STYLE ENVIRONMENT ACCESS DETECTOR
-========================================================= */
-
-const ROBLOX_SERVICES = [
-  "Players",
-  "Workspace",
-  "ReplicatedStorage",
-  "ReplicatedFirst",
-  "ServerStorage",
-  "ServerScriptService",
-  "StarterGui",
-  "StarterPack",
-  "StarterPlayer",
-  "Lighting",
-  "RunService",
-  "UserInputService",
-  "TweenService",
-  "HttpService",
-  "TeleportService",
-  "MarketplaceService",
-  "DataStoreService",
-  "CollectionService",
-  "TextService",
-  "SoundService",
-  "Teams",
-  "Chat"
-];
-
-function detectRobloxEnvironment(source) {
-  const services = [];
-  const globals = [];
-  const methods = [];
-
-  for (const service of ROBLOX_SERVICES) {
-    const regex =
-      new RegExp(
-        `["'\`]${service}["'\`]`,
-        "g"
-      );
-
-    if (regex.test(source)) {
-      services.push(service);
-    }
-  }
-
-  const globalPatterns = [
-    "game",
-    "workspace",
-    "script",
-    "plugin",
-    "shared",
-    "_G",
-    "getgenv",
-    "getfenv",
-    "setfenv"
-  ];
-
-  for (const name of globalPatterns) {
-    const regex =
-      new RegExp(
-        `\\b${name}\\b`,
-        "g"
-      );
-
-    if (regex.test(source)) {
-      globals.push(name);
-    }
-  }
-
-  const methodRegex =
-    /:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/g;
-
-  for (const match of source.matchAll(methodRegex)) {
-    methods.push(match[1]);
-  }
-
-  return {
-    services: [
-      ...new Set(services)
-    ],
-
-    globals: [
-      ...new Set(globals)
-    ],
-
-    methods: [
-      ...new Set(methods)
-    ]
-  };
-}
-
-/* =========================================================
-   ROBLOX-LIKE SANDBOX DUMPER
-========================================================= */
-
-/*
- * This does NOT execute the script.
- *
- * It creates a symbolic environment representation.
- */
-
-class SymbolicObject {
-  constructor(path) {
-    this.path = path;
-  }
-
-  get(property) {
-    return new SymbolicObject(
-      `${this.path}.${property}`
-    );
-  }
-
-  call(method, args = []) {
-    return {
-      type: "call",
-      object: this.path,
-      method,
-      arguments: args
-    };
-  }
-}
-
-function createSandboxModel() {
-  const game = new SymbolicObject("game");
-  const workspace =
-    new SymbolicObject("workspace");
-  const script =
-    new SymbolicObject("script");
-
-  return {
-    game,
-    workspace,
-    script,
-
-    services:
-      Object.fromEntries(
-        ROBLOX_SERVICES.map(name => [
-          name,
-          game.get(name)
-        ])
-      )
-  };
-}
-
-/* =========================================================
-   SYMBOLIC CALL EXTRACTION
-========================================================= */
-
-function extractCalls(source) {
-  const calls = [];
-
-  const regex =
-    /([A-Za-z_][A-Za-z0-9_.:]*)\s*\(([^()\n]{0,500})\)/g;
-
-  for (const match of source.matchAll(regex)) {
-    const expression =
-      match[1];
-
-    const args =
-      match[2]
-        .trim();
-
-    let object = null;
-    let method = expression;
-
-    if (expression.includes(":")) {
-      const parts =
-        expression.split(":");
-
-      method =
-        parts.pop();
-
-      object =
-        parts.join(":");
-    }
-
-    calls.push({
-      expression,
-      object,
-      method,
-      arguments:
-        args
-          ? args
-          : []
-    });
-  }
-
-  return calls.slice(0, 1000);
-}
-
-/* =========================================================
-   TABLE / ARRAY ANALYSIS
-========================================================= */
-
-function analyzeTables(source) {
-  const numericTables = [];
-  const stringTables = [];
-
-  const tableRegex =
-    /\{([\s\S]{0,20000})\}/g;
-
-  for (const match of source.matchAll(tableRegex)) {
-    const body = match[1];
-
-    const numbers =
-      body.match(
-        /-?\d+(?:\.\d+)?/g
-      ) || [];
-
-    const strings =
-      body.match(
-        /(["'])(.*?)\1/g
-      ) || [];
-
-    if (numbers.length >= 10) {
-      numericTables.push({
-        size: numbers.length,
-        sample:
-          numbers.slice(0, 20)
-      });
-    }
-
-    if (strings.length >= 5) {
-      stringTables.push({
-        size: strings.length,
-        sample:
-          strings
-            .slice(0, 20)
-      });
-    }
-  }
-
-  return {
-    numericTables:
-      numericTables.slice(0, 50),
-
-    stringTables:
-      stringTables.slice(0, 50)
-  };
-}
-
-/* =========================================================
-   STATIC TRANSFORMATIONS
-========================================================= */
+/* ============================================================
+   STRING ESCAPE RECOVERY
+============================================================ */
 
 function decodeDecimalEscapes(source) {
   return source.replace(
-    /\\(\d{1,3})/g,
+    /\\([0-9]{1,3})/g,
     (full, digits) => {
       const value =
         Number(digits);
@@ -804,12 +494,191 @@ function decodeDecimalEscapes(source) {
 function decodeHexEscapes(source) {
   return source.replace(
     /\\x([0-9a-fA-F]{2})/g,
-    (full, hex) =>
-      String.fromCharCode(
+    (full, hex) => {
+      return String.fromCharCode(
         parseInt(hex, 16)
-      )
+      );
+    }
   );
 }
+
+function decodeUnicodeEscapes(source) {
+  return source.replace(
+    /\\u\{([0-9a-fA-F]+)\}/g,
+    (full, hex) => {
+      try {
+        return String.fromCodePoint(
+          parseInt(hex, 16)
+        );
+      } catch {
+        return full;
+      }
+    }
+  );
+}
+
+/* ============================================================
+   STRING.CHAR RECOVERY
+============================================================ */
+
+function decodeStringChar(source) {
+  return source.replace(
+    /\bstring\s*\.\s*char\s*\(([^()]*)\)/gi,
+    (full, argumentsText) => {
+      const parts =
+        argumentsText
+          .split(",")
+          .map(x => x.trim())
+          .filter(Boolean);
+
+      if (!parts.length) {
+        return full;
+      }
+
+      const values = [];
+
+      for (const part of parts) {
+        if (!/^-?\d+$/.test(part)) {
+          return full;
+        }
+
+        const value =
+          Number(part);
+
+        if (
+          value < 0 ||
+          value > 255
+        ) {
+          return full;
+        }
+
+        values.push(value);
+      }
+
+      try {
+        return JSON.stringify(
+          String.fromCharCode(
+            ...values
+          )
+        );
+      } catch {
+        return full;
+      }
+    }
+  );
+}
+
+/* ============================================================
+   SIMPLE TABLE.CONCAT RECOVERY
+============================================================ */
+
+function decodeTableConcat(source) {
+  return source.replace(
+    /\btable\s*\.\s*concat\s*\(\s*\{([^{}]*)\}\s*\)/gi,
+    (full, body) => {
+      const values =
+        body.match(
+          /(["'])(?:\\.|(?!\1).)*\1/g
+        );
+
+      if (!values) {
+        return full;
+      }
+
+      const result = [];
+
+      for (const item of values) {
+        result.push(
+          item.slice(1, -1)
+        );
+      }
+
+      return JSON.stringify(
+        result.join("")
+      );
+    }
+  );
+}
+
+/* ============================================================
+   STRING CONCATENATION
+============================================================ */
+
+function foldStringConcat(source) {
+  let previous;
+
+  do {
+    previous = source;
+
+    /*
+     * "abc" .. "def"
+     */
+    source = source.replace(
+      /(["'])(.*?)\1\s*\.\.\s*(["'])(.*?)\3/g,
+      (full, q1, a, q2, b) => {
+        return JSON.stringify(
+          a + b
+        );
+      }
+    );
+
+  } while (
+    previous !== source
+  );
+
+  return source;
+}
+
+/* ============================================================
+   NUMBER HELPERS
+============================================================ */
+
+function isNumberToken(value) {
+  return /^-?(?:\d+(?:\.\d+)?|\.\d+)$/.test(
+    value
+  );
+}
+
+function calculateBinary(
+  a,
+  operator,
+  b
+) {
+  switch (operator) {
+    case "+":
+      return a + b;
+
+    case "-":
+      return a - b;
+
+    case "*":
+      return a * b;
+
+    case "/":
+      if (b === 0) {
+        return null;
+      }
+
+      return a / b;
+
+    case "%":
+      if (b === 0) {
+        return null;
+      }
+
+      return a % b;
+
+    case "^":
+      return Math.pow(a, b);
+
+    default:
+      return null;
+  }
+}
+
+/* ============================================================
+   ARITHMETIC CONSTANT FOLDING
+============================================================ */
 
 function foldArithmetic(source) {
   let previous;
@@ -817,8 +686,11 @@ function foldArithmetic(source) {
   do {
     previous = source;
 
+    /*
+     * Parenthesized simple expressions.
+     */
     source = source.replace(
-      /(?<![\w.])(-?\d+(?:\.\d+)?)\s*([+\-*\/])\s*(-?\d+(?:\.\d+)?)(?![\w.])/g,
+      /\(\s*(-?(?:\d+(?:\.\d+)?|\.\d+))\s*([+\-*\/%^])\s*(-?(?:\d+(?:\.\d+)?|\.\d+))\s*\)/g,
       (
         full,
         aText,
@@ -831,38 +703,59 @@ function foldArithmetic(source) {
         const b =
           Number(bText);
 
-        let result;
+        const result =
+          calculateBinary(
+            a,
+            operator,
+            b
+          );
 
-        switch (operator) {
-          case "+":
-            result = a + b;
-            break;
-
-          case "-":
-            result = a - b;
-            break;
-
-          case "*":
-            result = a * b;
-            break;
-
-          case "/":
-            if (b === 0) {
-              return full;
-            }
-
-            result = a / b;
-            break;
-
-          default:
-            return full;
+        if (
+          result === null ||
+          !Number.isFinite(result)
+        ) {
+          return full;
         }
 
-        return Number.isFinite(result)
-          ? String(result)
-          : full;
+        return String(result);
       }
     );
+
+    /*
+     * Unparenthesized simple expressions.
+     */
+    source = source.replace(
+      /(?<![\w.])(-?(?:\d+(?:\.\d+)?|\.\d+))\s*([+\-*\/%^])\s*(-?(?:\d+(?:\.\d+)?|\.\d+))(?![\w.])/g,
+      (
+        full,
+        aText,
+        operator,
+        bText
+      ) => {
+        const a =
+          Number(aText);
+
+        const b =
+          Number(bText);
+
+        const result =
+          calculateBinary(
+            a,
+            operator,
+            b
+          );
+
+        if (
+          result === null ||
+          !Number.isFinite(result)
+        ) {
+          return full;
+        }
+
+        return String(result);
+      }
+    );
+
   } while (
     previous !== source
   );
@@ -870,16 +763,136 @@ function foldArithmetic(source) {
   return source;
 }
 
-function foldStringConcat(source) {
+/* ============================================================
+   COMPARISON FOLDING
+============================================================ */
+
+function foldComparisons(source) {
+  return source.replace(
+    /(?<![\w.])(-?\d+(?:\.\d+)?)\s*(==|~=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?)(?![\w.])/g,
+    (
+      full,
+      aText,
+      operator,
+      bText
+    ) => {
+      const a =
+        Number(aText);
+
+      const b =
+        Number(bText);
+
+      let result;
+
+      switch (operator) {
+        case "==":
+          result = a === b;
+          break;
+
+        case "~=":
+          result = a !== b;
+          break;
+
+        case "<":
+          result = a < b;
+          break;
+
+        case ">":
+          result = a > b;
+          break;
+
+        case "<=":
+          result = a <= b;
+          break;
+
+        case ">=":
+          result = a >= b;
+          break;
+
+        default:
+          return full;
+      }
+
+      return result
+        ? "true"
+        : "false";
+    }
+  );
+}
+
+/* ============================================================
+   BOOLEAN CONSTANTS
+============================================================ */
+
+function foldBooleanConstants(source) {
+  let previous;
+
+  do {
+    previous = source;
+
+    source = source
+      .replace(
+        /\bnot\s+true\b/gi,
+        "false"
+      )
+      .replace(
+        /\bnot\s+false\b/gi,
+        "true"
+      )
+      .replace(
+        /\btrue\s+and\s+true\b/gi,
+        "true"
+      )
+      .replace(
+        /\btrue\s+and\s+false\b/gi,
+        "false"
+      )
+      .replace(
+        /\bfalse\s+and\s+true\b/gi,
+        "false"
+      )
+      .replace(
+        /\bfalse\s+and\s+false\b/gi,
+        "false"
+      )
+      .replace(
+        /\btrue\s+or\s+true\b/gi,
+        "true"
+      )
+      .replace(
+        /\btrue\s+or\s+false\b/gi,
+        "true"
+      )
+      .replace(
+        /\bfalse\s+or\s+true\b/gi,
+        "true"
+      );
+
+  } while (
+    previous !== source
+  );
+
+  return source;
+}
+
+/* ============================================================
+   PARENTHESIS NORMALIZATION
+============================================================ */
+
+function simplifyParentheses(source) {
   let previous;
 
   do {
     previous = source;
 
     source = source.replace(
-      /(["'])(.*?)\1\s*\.\.\s*(["'])(.*?)\3/g,
-      (full, q1, a, q2, b) =>
-        JSON.stringify(a + b)
+      /\(\s*(-?\d+(?:\.\d+)?)\s*\)/g,
+      "$1"
+    );
+
+    source = source.replace(
+      /\(\s*(true|false|nil)\s*\)/gi,
+      "$1"
     );
 
   } while (
@@ -889,12 +902,231 @@ function foldStringConcat(source) {
   return source;
 }
 
-function removeComments(source) {
+/* ============================================================
+   LOCAL STRING ALIASES
+============================================================ */
+
+function resolveLocalStringAliases(source) {
+  const aliases = new Map();
+
+  const regex =
+    /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(["'])(.*?)\2\s*;?/g;
+
+  for (
+    const match of source.matchAll(
+      regex
+    )
+  ) {
+    aliases.set(
+      match[1],
+      JSON.stringify(
+        match[3]
+      )
+    );
+  }
+
+  /*
+   * Only replace aliases when the identifier is not
+   * obviously being assigned again.
+   */
+  for (
+    const [name, value] of aliases
+  ) {
+    const regex =
+      new RegExp(
+        `\\b${escapeRegex(name)}\\b`,
+        "g"
+      );
+
+    source =
+      source.replace(
+        regex,
+        value
+      );
+  }
+
+  return source;
+}
+
+/* ============================================================
+   LOCAL CONSTANT ALIASES
+============================================================ */
+
+function resolveConstantAliases(source) {
+  const aliases = new Map();
+
+  const regex =
+    /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(-?\d+(?:\.\d+)?|true|false|nil)\s*;?/g;
+
+  for (
+    const match of source.matchAll(
+      regex
+    )
+  ) {
+    aliases.set(
+      match[1],
+      match[2]
+    );
+  }
+
+  for (
+    const [name, value] of aliases
+  ) {
+    const regex =
+      new RegExp(
+        `\\b${escapeRegex(name)}\\b`,
+        "g"
+      );
+
+    source =
+      source.replace(
+        regex,
+        value
+      );
+  }
+
+  return source;
+}
+
+/* ============================================================
+   CONSTANT IF RECOVERY
+============================================================ */
+
+function simplifyConstantIfs(source) {
+  /*
+   * Only simple cases.
+   */
   source = source.replace(
-    /--$begin:math:display$\\\[\[\\s\\S\]\*\?$end:math:display$\]/g,
+    /if\s+true\s+then([\s\S]*?)\bend\b/gi,
+    "$1"
+  );
+
+  source = source.replace(
+    /if\s+false\s+then([\s\S]*?)\bend\b/gi,
     ""
   );
 
+  return source;
+}
+
+/* ============================================================
+   CONSTANT RETURN NORMALIZATION
+============================================================ */
+
+function simplifyConstantReturns(source) {
+  return source.replace(
+    /return\s*\(\s*(["'])(.*?)\1\s*\)/g,
+    (
+      full,
+      quote,
+      value
+    ) => {
+      return (
+        "return " +
+        quote +
+        value +
+        quote
+      );
+    }
+  );
+}
+
+/* ============================================================
+   SIMPLE CONSTANT FUNCTION NORMALIZATION
+============================================================ */
+
+function simplifyConstantFunctions(source) {
+  return source.replace(
+    /local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*return\s+((?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|-?\d+(?:\.\d+)?|true|false|nil))\s*end/gi,
+    (
+      full,
+      name,
+      value
+    ) => {
+      return (
+        `local ${name} = function()\n` +
+        `    return ${value}\n` +
+        `end`
+      );
+    }
+  );
+}
+
+/* ============================================================
+   TABLE NORMALIZATION
+============================================================ */
+
+function simplifyNumericTables(source) {
+  return source.replace(
+    /\{\s*(-?\d+(?:\s*,\s*-?\d+)+)\s*\}/g,
+    (
+      full,
+      values
+    ) => {
+      const items =
+        values
+          .split(",")
+          .map(x => x.trim());
+
+      if (
+        items.length > 500
+      ) {
+        return full;
+      }
+
+      return (
+        "{ " +
+        items.join(", ") +
+        " }"
+      );
+    }
+  );
+}
+
+function simplifyStringTables(source) {
+  return source.replace(
+    /\{\s*((?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*')(?:\s*,\s*(?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'))+)\s*\}/g,
+    (
+      full,
+      body
+    ) => {
+      const values =
+        body.match(
+          /"(?:\\.|[^"])*"|'(?:\\.|[^'])*'/g
+        );
+
+      if (!values) {
+        return full;
+      }
+
+      return (
+        "{ " +
+        values.join(", ") +
+        " }"
+      );
+    }
+  );
+}
+
+/* ============================================================
+   COMMENT REMOVAL
+============================================================ */
+
+function removeComments(source) {
+  /*
+   * Lua long comments.
+   */
+  source = source.replace(
+    /--\[\[[\s\S]*?\]\]/g,
+    ""
+  );
+
+  /*
+   * Normal comments.
+   *
+   * This intentionally avoids trying to remove text
+   * inside quoted strings.
+   */
   source = source.replace(
     /--[^\r\n]*/g,
     ""
@@ -903,405 +1135,129 @@ function removeComments(source) {
   return source;
 }
 
+/* ============================================================
+   WHITESPACE
+============================================================ */
+
 function normalizeWhitespace(source) {
   return source
-    .split(/\r?\n/)
-    .map(x => x.trimEnd())
+    .replace(
+      /\r\n/g,
+      "\n"
+    )
+    .replace(
+      /\r/g,
+      "\n"
+    )
+    .split("\n")
+    .map(line =>
+      line.replace(
+        /[ \t]+$/g,
+        ""
+      )
+    )
     .join("\n")
     .replace(
       /\n{4,}/g,
       "\n\n\n"
-    );
+    )
+    .trim();
 }
 
-/* =========================================================
-   STATIC ANALYZER
-========================================================= */
+/* ============================================================
+   REGEX ESCAPE
+============================================================ */
 
-function analyzeSource(source) {
-  const strings =
-    extractQuotedStrings(source);
-
-  const numbers =
-    extractNumbers(source);
-
-  const functions =
-    extractFunctionNames(source);
-
-  const calls =
-    extractCalls(source);
-
-  const vm =
-    detectVMStructures(source);
-
-  const roblox =
-    detectRobloxEnvironment(source);
-
-  const tables =
-    analyzeTables(source);
-
-  return {
-    lines:
-      source.split(/\r?\n/).length,
-
-    characters:
-      source.length,
-
-    functions,
-
-    strings,
-
-    numbers,
-
-    calls,
-
-    vm,
-
-    roblox,
-
-    tables,
-
-    urls:
-      extractUrls(source),
-
-    loadstrings:
-      extractLoadstringUrls(source)
-  };
+function escapeRegex(value) {
+  return value.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
 }
 
-/* =========================================================
-   FULL ANALYSIS / DUMP
-========================================================= */
+/* ============================================================
+   STATIC RECOVERY PIPELINE
+============================================================ */
 
-function createDump(source) {
-  const analysis =
-    analyzeSource(source);
-
-  const sandbox =
-    createSandboxModel();
-
-  const dump = [];
-
-  dump.push(
-    "============================================================"
-  );
-
-  dump.push(
-    "ROBLOX-LIKE STATIC DUMPER"
-  );
-
-  dump.push(
-    "============================================================"
-  );
-
-  dump.push("");
-
-  dump.push(
-    "[SOURCE]"
-  );
-
-  dump.push(
-    `Lines: ${analysis.lines}`
-  );
-
-  dump.push(
-    `Characters: ${analysis.characters}`
-  );
-
-  dump.push("");
-
-  dump.push(
-    "[FUNCTIONS]"
-  );
-
-  if (analysis.functions.length) {
-    for (const name of analysis.functions) {
-      dump.push(
-        `- ${name}`
-      );
-    }
-  } else {
-    dump.push(
-      "- None detected"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[VM STRUCTURE]"
-  );
-
-  if (analysis.vm.length) {
-    for (const item of analysis.vm) {
-      dump.push(
-        `- ${item}`
-      );
-    }
-  } else {
-    dump.push(
-      "- No common VM indicators detected"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[ROBLOX ENVIRONMENT]"
-  );
-
-  dump.push(
-    `Globals: ${
-      analysis.roblox.globals.join(", ") ||
-      "none"
-    }`
-  );
-
-  dump.push(
-    `Services: ${
-      analysis.roblox.services.join(", ") ||
-      "none"
-    }`
-  );
-
-  dump.push(
-    `Methods: ${
-      analysis.roblox.methods
-        .slice(0, 100)
-        .join(", ") ||
-      "none"
-    }`
-  );
-
-  dump.push("");
-
-  dump.push(
-    "[SYMBOLIC ENVIRONMENT]"
-  );
-
-  dump.push(
-    `game -> ${sandbox.game.path}`
-  );
-
-  dump.push(
-    `workspace -> ${sandbox.workspace.path}`
-  );
-
-  dump.push(
-    `script -> ${sandbox.script.path}`
-  );
-
-  dump.push("");
-
-  dump.push(
-    "[CALLS]"
-  );
-
-  for (
-    const call of analysis.calls.slice(0, 250)
-  ) {
-    dump.push(
-      `- ${call.expression}(${call.arguments})`
-    );
-  }
-
-  if (!analysis.calls.length) {
-    dump.push(
-      "- None detected"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[STRING TABLE]"
-  );
-
-  for (
-    const value of analysis.strings.slice(0, 500)
-  ) {
-    dump.push(
-      JSON.stringify(value)
-    );
-  }
-
-  if (!analysis.strings.length) {
-    dump.push(
-      "- Empty"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[NUMERIC CONSTANTS]"
-  );
-
-  dump.push(
-    analysis.numbers
-      .slice(0, 500)
-      .join(", ")
-  );
-
-  dump.push("");
-
-  dump.push(
-    "[NUMERIC TABLES]"
-  );
-
-  for (
-    const table of analysis.tables.numericTables
-  ) {
-    dump.push(
-      `- ${table.size} entries: ${table.sample.join(", ")}`
-    );
-  }
-
-  if (
-    !analysis.tables.numericTables.length
-  ) {
-    dump.push(
-      "- None detected"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[STRING TABLES]"
-  );
-
-  for (
-    const table of analysis.tables.stringTables
-  ) {
-    dump.push(
-      `- ${table.size} entries`
-    );
-
-    dump.push(
-      `  ${table.sample.join(", ")}`
-    );
-  }
-
-  if (
-    !analysis.tables.stringTables.length
-  ) {
-    dump.push(
-      "- None detected"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[URLS]"
-  );
-
-  for (const url of analysis.urls) {
-    dump.push(
-      `- ${url}`
-    );
-  }
-
-  if (!analysis.urls.length) {
-    dump.push(
-      "- None"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "[LOADSTRINGS]"
-  );
-
-  for (const url of analysis.loadstrings) {
-    dump.push(
-      `- ${url}`
-    );
-  }
-
-  if (!analysis.loadstrings.length) {
-    dump.push(
-      "- None"
-    );
-  }
-
-  dump.push("");
-
-  dump.push(
-    "============================================================"
-  );
-
-  dump.push(
-    "END STATIC DUMP"
-  );
-
-  dump.push(
-    "============================================================"
-  );
-
-  return dump.join("\n");
-}
-
-/* =========================================================
-   SAFE STATIC PROCESSOR
-========================================================= */
-
-function processSource(source) {
+function recoverLua(source) {
   let output = source;
 
-  const passes = [];
+  /*
+   * Multiple rounds are useful because one pass can expose
+   * another constant expression.
+   */
+  const passes = [
+    decodeDecimalEscapes,
+    decodeHexEscapes,
+    decodeUnicodeEscapes,
+    decodeStringChar,
+    decodeTableConcat,
+    foldStringConcat,
+    foldArithmetic,
+    foldComparisons,
+    foldBooleanConstants,
+    simplifyParentheses,
+    resolveLocalStringAliases,
+    resolveConstantAliases,
+    simplifyConstantIfs,
+    simplifyConstantReturns,
+    simplifyConstantFunctions,
+    simplifyNumericTables,
+    simplifyStringTables
+  ];
 
-  function apply(name, fn) {
-    const before = output;
+  for (let round = 0; round < 12; round++) {
+    let changed = false;
 
-    output = fn(output);
+    for (const pass of passes) {
+      const before = output;
 
-    if (output !== before) {
-      passes.push(name);
+      try {
+        output =
+          pass(output);
+      } catch {
+        /*
+         * A failed transformation must never destroy
+         * the source.
+         */
+        output = before;
+      }
+
+      if (output !== before) {
+        changed = true;
+      }
+    }
+
+    if (!changed) {
+      break;
     }
   }
 
-  apply(
-    "decimal escape decoding",
-    decodeDecimalEscapes
-  );
+  /*
+   * Formatting is deliberately last.
+   */
+  output =
+    removeComments(output);
 
-  apply(
-    "hex escape decoding",
-    decodeHexEscapes
-  );
+  output =
+    normalizeWhitespace(output);
 
-  apply(
-    "arithmetic constant folding",
-    foldArithmetic
-  );
+  /*
+   * Never return an empty result when the input wasn't empty.
+   */
+  if (
+    source.trim() &&
+    !output.trim()
+  ) {
+    return source;
+  }
 
-  apply(
-    "string concatenation folding",
-    foldStringConcat
-  );
-
-  apply(
-    "comment removal",
-    removeComments
-  );
-
-  apply(
-    "whitespace normalization",
-    normalizeWhitespace
-  );
-
-  return {
-    source: output,
-    passes
-  };
+  return output;
 }
 
-/* =========================================================
+/* ============================================================
    DISCORD READY
-========================================================= */
+============================================================ */
 
 client.once(
   "ready",
@@ -1321,9 +1277,9 @@ client.once(
   }
 );
 
-/* =========================================================
+/* ============================================================
    COMMAND HANDLER
-========================================================= */
+============================================================ */
 
 client.on(
   "interactionCreate",
@@ -1334,6 +1290,10 @@ client.on(
       return;
     }
 
+    /* --------------------------------------------------------
+       PING
+    -------------------------------------------------------- */
+
     if (
       interaction.commandName === "ping"
     ) {
@@ -1343,6 +1303,10 @@ client.on(
 
       return;
     }
+
+    /* --------------------------------------------------------
+       DEOBF
+    -------------------------------------------------------- */
 
     if (
       interaction.commandName !== "deobf"
@@ -1360,10 +1324,13 @@ client.on(
         "file"
       );
 
-    if (!input && !attachment) {
+    if (
+      !input &&
+      !attachment
+    ) {
       await interaction.reply({
         content:
-          "❌ Provide Lua source, a loadstring, a raw URL, or upload a Lua file.",
+          "Provide Lua source, a raw URL, a loadstring, or a Lua file.",
         ephemeral: true
       });
 
@@ -1373,61 +1340,89 @@ client.on(
     await interaction.deferReply();
 
     try {
-      let originalSource;
-      let filename = "analysis.lua";
+      let source = null;
 
-      /* -----------------------------------------
+      /* ------------------------------------------------------
          FILE
-      ----------------------------------------- */
+      ------------------------------------------------------ */
 
       if (attachment) {
-        const name =
-          attachment.name.toLowerCase();
+        const filename =
+          attachment.name ||
+          "source.lua";
+
+        const lower =
+          filename.toLowerCase();
 
         if (
-          !name.endsWith(".lua") &&
-          !name.endsWith(".luau") &&
-          !name.endsWith(".txt")
+          !lower.endsWith(".lua") &&
+          !lower.endsWith(".luau") &&
+          !lower.endsWith(".txt")
         ) {
           throw new Error(
             "Only .lua, .luau, and .txt files are supported."
           );
         }
 
-        filename =
-          attachment.name;
+        let response;
 
-        const response =
-          await fetch(
-            attachment.url,
-            {
-              signal:
-                AbortSignal.timeout(
-                  30000
-                )
-            }
-          );
-
-        if (!response.ok) {
+        try {
+          response =
+            await fetch(
+              attachment.url,
+              {
+                signal:
+                  AbortSignal.timeout(
+                    30000
+                  )
+              }
+            );
+        } catch (error) {
           throw new Error(
-            `Discord returned HTTP ${response.status}.`
+            `Failed to download Discord attachment: ${error.message}`
           );
         }
 
-        originalSource =
+        if (!response.ok) {
+          throw new Error(
+            `Discord attachment returned HTTP ${response.status}.`
+          );
+        }
+
+        source =
           await response.text();
       }
 
-      /* -----------------------------------------
-         TEXT
-      ----------------------------------------- */
+      /* ------------------------------------------------------
+         TEXT / URL / LOADSTRING
+      ------------------------------------------------------ */
 
       else {
-        originalSource = input;
+        const possibleURL =
+          resolveStandaloneURL(
+            input
+          );
+
+        if (possibleURL) {
+          source =
+            await fetchSource(
+              possibleURL
+            );
+        } else {
+          source = input;
+        }
       }
 
       if (
-        originalSource.length >
+        typeof source !== "string"
+      ) {
+        throw new Error(
+          "Input could not be converted to text."
+        );
+      }
+
+      if (
+        source.length >
         MAX_SOURCE_SIZE
       ) {
         throw new Error(
@@ -1435,190 +1430,46 @@ client.on(
         );
       }
 
-      /* -----------------------------------------
-         DIRECT URL
-      ----------------------------------------- */
+      /* ------------------------------------------------------
+         FETCH LOADSTRING SOURCE CHAIN
+      ------------------------------------------------------ */
 
-      const directURL =
-        resolveInputURL(
-          originalSource
+      source =
+        await resolveRemoteChain(
+          source
         );
 
-      let source =
-        originalSource;
-
-      let sourceChain = [];
-
-      if (directURL) {
-        console.log(
-          `[DIRECT INPUT] ${directURL}`
-        );
-
-        source =
-          await fetchSource(
-            directURL
-          );
-
-        sourceChain.push(
-          directURL
+      if (
+        source.length >
+        MAX_SOURCE_SIZE
+      ) {
+        throw new Error(
+          "Resolved source exceeds the 2 MB limit."
         );
       }
 
-      /* -----------------------------------------
-         LOADSTRING CHAIN
-      ----------------------------------------- */
+      /* ------------------------------------------------------
+         STATIC RECOVERY
+      ------------------------------------------------------ */
 
-      const resolved =
-        await resolveRecursive(
-          source,
-          0,
-          new Set(sourceChain)
-        );
+      const recovered =
+        recoverLua(source);
 
-      source =
-        resolved.source;
-
-      sourceChain = [
-        ...sourceChain,
-        ...resolved.chain
-      ];
-
-      /* -----------------------------------------
-         STATIC PROCESS
-      ----------------------------------------- */
-
-      const processed =
-        processSource(source);
-
-      /* -----------------------------------------
-         ANALYSIS
-      ----------------------------------------- */
-
-      const analysis =
-        analyzeSource(
-          processed.source
-        );
-
-      /* -----------------------------------------
-         ROBLOX-LIKE DUMP
-      ----------------------------------------- */
-
-      const dump =
-        createDump(
-          processed.source
-        );
-
-      /* -----------------------------------------
-         RAW FILES
-      ----------------------------------------- */
+      /* ------------------------------------------------------
+         RAW OUTPUT
+      ------------------------------------------------------ */
 
       const rawURL =
         publishRaw(
-          processed.source,
-          filename
+          recovered,
+          "recovered.lua"
         );
 
-      const dumpURL =
-        publishRaw(
-          dump,
-          "static-dump.txt"
-        );
-
-      /* -----------------------------------------
-         RESPONSE
-      ----------------------------------------- */
-
-      let message =
-        "## ✅ Static Analysis Complete\n\n";
-
-      message +=
-        `**Input:** ${originalSource.length.toLocaleString()} characters\n`;
-
-      message +=
-        `**Analyzed:** ${processed.source.length.toLocaleString()} characters\n`;
-
-      message +=
-        `**Lines:** ${analysis.lines.toLocaleString()}\n`;
-
-      message +=
-        `**Functions:** ${analysis.functions.length.toLocaleString()}\n`;
-
-      message +=
-        `**Strings:** ${analysis.strings.length.toLocaleString()}\n`;
-
-      message +=
-        `**Calls:** ${analysis.calls.length.toLocaleString()}\n\n`;
-
-      message +=
-        `### 📄 Processed Source\n${rawURL}\n\n`;
-
-      message +=
-        `### 🔬 Static Dump\n${dumpURL}\n\n`;
-
-      message +=
-        "### 🧠 VM Indicators\n";
-
-      if (analysis.vm.length) {
-        message +=
-          analysis.vm
-            .map(x => `- ${x}`)
-            .join("\n");
-      } else {
-        message +=
-          "- None detected";
-      }
-
-      message +=
-        "\n\n### 🎮 Roblox Environment\n";
-
-      message +=
-        `**Globals:** ${
-          analysis.roblox.globals.join(", ") ||
-          "none"
-        }\n`;
-
-      message +=
-        `**Services:** ${
-          analysis.roblox.services.join(", ") ||
-          "none"
-        }\n`;
-
-      if (sourceChain.length) {
-        message +=
-          "\n### 🌐 Loaded Sources\n";
-
-        message +=
-          sourceChain
-            .map(x => `- ${x}`)
-            .join("\n");
-      }
-
-      if (resolved.stopped) {
-        message +=
-          `\n\n⚠️ ${resolved.stopped}`;
-      }
-
-      message +=
-        "\n\n### 🔧 Static Transformations\n";
-
-      if (processed.passes.length) {
-        message +=
-          processed.passes
-            .map(x => `- ${x}`)
-            .join("\n");
-      } else {
-        message +=
-          "- None";
-      }
-
-      if (message.length > 1900) {
-        message =
-          message.slice(0, 1800) +
-          "\n\n...complete results are available through the raw links above.";
-      }
-
+      /*
+       * Discord message contains ONLY the raw Lua URL.
+       */
       await interaction.editReply(
-        message
+        rawURL
       );
 
     } catch (error) {
@@ -1627,24 +1478,31 @@ client.on(
         error
       );
 
+      const message =
+        String(
+          error?.message ||
+          error
+        ).slice(
+          0,
+          1500
+        );
+
       await interaction.editReply(
-        `❌ **Failed**\n\`\`\`\n${String(
-          error.message || error
-        ).slice(0, 1600)}\n\`\`\``
+        `❌ ${message}`
       );
     }
   }
 );
 
-/* =========================================================
-   ERROR HANDLERS
-========================================================= */
+/* ============================================================
+   DISCORD ERROR HANDLERS
+============================================================ */
 
 client.on(
   "error",
   error => {
     console.error(
-      "Discord error:",
+      "Discord client error:",
       error
     );
   }
@@ -1670,8 +1528,8 @@ process.on(
   }
 );
 
-/* =========================================================
+/* ============================================================
    LOGIN
-========================================================= */
+============================================================ */
 
 client.login(TOKEN);
