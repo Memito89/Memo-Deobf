@@ -32,22 +32,21 @@ if (!TOKEN || !CLIENT_ID || !GUILD_ID) {
 
 if (!PUBLIC_URL) {
   console.warn(
-    "PUBLIC_URL is not set. Raw links will not work correctly."
+    "WARNING: PUBLIC_URL is not configured."
   );
 }
 
 /* =========================================================
-   EXPRESS / RAW SOURCE HOST
+   EXPRESS SERVER
 ========================================================= */
 
 const app = express();
-
 const rawStore = new Map();
 
 app.get("/", (req, res) => {
-  res
-    .type("text")
-    .send("Lua deobfuscation service online.");
+  res.type("text").send(
+    "Lua deobfuscation service online."
+  );
 });
 
 app.get("/health", (req, res) => {
@@ -61,9 +60,10 @@ app.get("/raw/:id", (req, res) => {
   const item = rawStore.get(req.params.id);
 
   if (!item) {
-    return res.status(404).type("text").send(
-      "Source not found or expired."
-    );
+    return res
+      .status(404)
+      .type("text")
+      .send("Source not found or expired.");
   }
 
   res.setHeader(
@@ -95,6 +95,12 @@ app.listen(PORT, "0.0.0.0", () => {
 ========================================================= */
 
 function publishRaw(source, filename) {
+  if (!PUBLIC_URL) {
+    throw new Error(
+      "PUBLIC_URL is not configured in Railway Variables."
+    );
+  }
+
   const id = crypto
     .randomBytes(16)
     .toString("hex");
@@ -109,7 +115,11 @@ function publishRaw(source, filename) {
     rawStore.delete(id);
   }, RAW_LIFETIME);
 
-  return `${PUBLIC_URL.replace(/\/$/, "")}/raw/${id}`;
+  return (
+    PUBLIC_URL.replace(/\/$/, "") +
+    "/raw/" +
+    id
+  );
 }
 
 /* =========================================================
@@ -126,7 +136,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName("deobf")
     .setDescription(
-      "Statically process Lua/Luau source"
+      "Process Lua/Luau source"
     )
     .addStringOption(option =>
       option
@@ -140,7 +150,7 @@ const commands = [
       option
         .setName("file")
         .setDescription(
-          "Upload a .lua, .luau, or .txt file"
+          "Upload .lua, .luau, or .txt"
         )
         .setRequired(false)
     ),
@@ -150,7 +160,7 @@ const commands = [
     .setDescription(
       "Check whether the bot is online"
     )
-].map(command => command.toJSON());
+].map(x => x.toJSON());
 
 async function registerCommands() {
   const rest = new REST({
@@ -168,7 +178,7 @@ async function registerCommands() {
   );
 
   console.log(
-    "Slash commands registered."
+    "Discord slash commands registered."
   );
 }
 
@@ -176,41 +186,90 @@ async function registerCommands() {
    URL EXTRACTION
 ========================================================= */
 
+/*
+ * Finds actual HTTP/HTTPS URLs.
+ *
+ * Importantly, this does NOT accept things like:
+ *
+ * https://r/
+ *
+ * unless "r" is actually a valid domain.
+ */
+
 function extractUrls(source) {
-  const regex =
-    /https?:\/\/[^\s"'`<>()$begin:math:display$$end:math:display${}]+/gi;
+  const matches = source.match(
+    /https?:\/\/(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}(?::\d+)?(?:\/[^\s"'`<>()$begin:math:display$$end:math:display${}]*)?/gi
+  );
+
+  if (!matches) {
+    return [];
+  }
 
   return [
     ...new Set(
-      [...source.matchAll(regex)]
-        .map(m =>
-          m[0].replace(/[.,;]+$/, "")
-        )
+      matches.map(url =>
+        url.replace(/[.,;]+$/, "")
+      )
     )
   ];
 }
+
+/*
+ * Specifically extracts URLs from common
+ * loadstring/HttpGet forms.
+ */
 
 function extractLoadstringUrls(source) {
   const urls = new Set();
 
   const patterns = [
-    /loadstring\s*\(\s*game\s*:\s*HttpGet\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]/gi,
+    /*
+     * loadstring(game:HttpGet("URL"))
+     */
+    /loadstring\s*\(\s*game\s*:\s*HttpGet\s*\(\s*["'`]([^"'`]+)["'`]/gi,
 
-    /loadstring\s*\(\s*game\s*\.\s*HttpGet\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]/gi,
+    /*
+     * loadstring(game.HttpGet("URL"))
+     */
+    /loadstring\s*\(\s*game\s*\.\s*HttpGet\s*\(\s*["'`]([^"'`]+)["'`]/gi,
 
+    /*
+     * loadstring("URL")
+     */
     /loadstring\s*\(\s*["'`](https?:\/\/[^"'`]+)["'`]\s*\)/gi
   ];
 
   for (const regex of patterns) {
     for (const match of source.matchAll(regex)) {
-      urls.add(match[1]);
+      const candidate = match[1];
+
+      try {
+        const url = new URL(candidate);
+
+        if (
+          url.protocol === "http:" ||
+          url.protocol === "https:"
+        ) {
+          urls.add(url.href);
+        }
+      } catch {
+        // Ignore malformed URL candidates.
+      }
     }
   }
 
   return [...urls];
 }
 
+/*
+ * Used when the user's entire input might itself
+ * be a URL or might contain a loadstring.
+ */
+
 function resolveInputURL(input) {
+  /*
+   * 1. loadstring(...)
+   */
   const loadstringUrls =
     extractLoadstringUrls(input);
 
@@ -218,8 +277,28 @@ function resolveInputURL(input) {
     return loadstringUrls[0];
   }
 
-  const urls =
-    extractUrls(input);
+  /*
+   * 2. Entire input is a URL.
+   */
+  const trimmed = input.trim();
+
+  try {
+    const url = new URL(trimmed);
+
+    if (
+      url.protocol === "http:" ||
+      url.protocol === "https:"
+    ) {
+      return url.href;
+    }
+  } catch {
+    // Not a standalone URL.
+  }
+
+  /*
+   * 3. URL somewhere inside input.
+   */
+  const urls = extractUrls(input);
 
   if (urls.length) {
     return urls[0];
@@ -229,17 +308,21 @@ function resolveInputURL(input) {
 }
 
 /* =========================================================
-   SAFE REMOTE FETCHING
+   REMOTE FETCH
 ========================================================= */
 
 async function fetchSource(url) {
+  console.log(
+    `[FETCH] Attempting: ${url}`
+  );
+
   let parsed;
 
   try {
     parsed = new URL(url);
   } catch {
     throw new Error(
-      `Invalid URL: ${url}`
+      `Invalid extracted URL: ${url}`
     );
   }
 
@@ -248,13 +331,9 @@ async function fetchSource(url) {
     parsed.protocol !== "https:"
   ) {
     throw new Error(
-      "Only HTTP and HTTPS URLs are supported."
+      `Unsupported URL protocol: ${parsed.protocol}`
     );
   }
-
-  console.log(
-    `[FETCH] ${parsed.href}`
-  );
 
   try {
     const response = await fetch(
@@ -262,19 +341,21 @@ async function fetchSource(url) {
       {
         method: "GET",
         redirect: "follow",
+
         headers: {
           "User-Agent":
-            "Mozilla/5.0 Lua-Deobf-Bot/3.0",
+            "Mozilla/5.0 (compatible; LuaDeobfBot/3.1)",
           "Accept":
             "text/plain,text/*,*/*"
         },
+
         signal:
           AbortSignal.timeout(30000)
       }
     );
 
     console.log(
-      `[HTTP] ${response.status} ${response.statusText}`
+      `[FETCH] ${response.status} ${response.statusText}`
     );
 
     if (!response.ok) {
@@ -286,9 +367,9 @@ async function fetchSource(url) {
     const source =
       await response.text();
 
-    if (!source.length) {
+    if (!source.trim()) {
       throw new Error(
-        "The remote URL returned an empty response."
+        "The URL returned an empty response."
       );
     }
 
@@ -305,31 +386,35 @@ async function fetchSource(url) {
 
   } catch (error) {
     console.error(
-      `[FETCH ERROR] ${parsed.href}`,
-      error
+      `[FETCH FAILED] ${parsed.href}`
     );
 
+    console.error(error);
+
     throw new Error(
-      `Fetch failed for ${parsed.href}: ${error.message}`
+      `Could not fetch ${parsed.href}: ${error.message}`
     );
   }
 }
 
 /* =========================================================
-   STATIC DECODERS
+   STATIC STRING DECODERS
 ========================================================= */
 
 function decodeDecimalEscapes(source) {
   return source.replace(
     /\\(\d{1,3})/g,
     (full, digits) => {
-      const value = Number(digits);
+      const value =
+        Number(digits);
 
       if (
         value >= 0 &&
         value <= 255
       ) {
-        return String.fromCharCode(value);
+        return String.fromCharCode(
+          value
+        );
       }
 
       return full;
@@ -347,11 +432,17 @@ function decodeHexEscapes(source) {
   );
 }
 
+/* =========================================================
+   BASE64
+========================================================= */
+
 function looksLikeBase64(value) {
   return (
     value.length >= 16 &&
     value.length % 4 === 0 &&
-    /^[A-Za-z0-9+/]+={0,2}$/.test(value)
+    /^[A-Za-z0-9+/]+={0,2}$/.test(
+      value
+    )
   );
 }
 
@@ -370,6 +461,10 @@ function decodeBase64Strings(source) {
             "base64"
           ).toString("utf8");
 
+        /*
+         * Don't replace arbitrary binary-looking
+         * data with garbage.
+         */
         if (
           /[\x00-\x08\x0E-\x1F]/.test(
             decoded
@@ -380,13 +475,7 @@ function decodeBase64Strings(source) {
 
         return (
           quote +
-          decoded.replace(
-            new RegExp(
-              `\\${quote}`,
-              "g"
-            ),
-            `\\${quote}`
-          ) +
+          decoded +
           quote
         );
 
@@ -398,7 +487,7 @@ function decodeBase64Strings(source) {
 }
 
 /* =========================================================
-   STATIC XOR
+   SIMPLE XOR
 ========================================================= */
 
 function xorBytes(value, key) {
@@ -421,7 +510,8 @@ function decodeSimpleXorCalls(source) {
   return source.replace(
     /\bxor\s*\(\s*["']([^"']+)["']\s*,\s*(\d{1,3})\s*\)/gi,
     (full, value, keyText) => {
-      const key = Number(keyText);
+      const key =
+        Number(keyText);
 
       if (
         key < 0 ||
@@ -431,14 +521,17 @@ function decodeSimpleXorCalls(source) {
       }
 
       return JSON.stringify(
-        xorBytes(value, key)
+        xorBytes(
+          value,
+          key
+        )
       );
     }
   );
 }
 
 /* =========================================================
-   CONSTANT FOLDING
+   ARITHMETIC CONSTANT FOLDING
 ========================================================= */
 
 function foldArithmetic(source) {
@@ -449,13 +542,21 @@ function foldArithmetic(source) {
 
     source = source.replace(
       /(?<![\w.])(-?\d+(?:\.\d+)?)\s*([+\-*\/])\s*(-?\d+(?:\.\d+)?)(?![\w.])/g,
-      (full, aText, op, bText) => {
-        const a = Number(aText);
-        const b = Number(bText);
+      (
+        full,
+        aText,
+        operator,
+        bText
+      ) => {
+        const a =
+          Number(aText);
+
+        const b =
+          Number(bText);
 
         let result;
 
-        switch (op) {
+        switch (operator) {
           case "+":
             result = a + b;
             break;
@@ -469,7 +570,10 @@ function foldArithmetic(source) {
             break;
 
           case "/":
-            if (b === 0) return full;
+            if (b === 0) {
+              return full;
+            }
+
             result = a / b;
             break;
 
@@ -477,7 +581,9 @@ function foldArithmetic(source) {
             return full;
         }
 
-        if (!Number.isFinite(result)) {
+        if (
+          !Number.isFinite(result)
+        ) {
           return full;
         }
 
@@ -485,10 +591,16 @@ function foldArithmetic(source) {
       }
     );
 
-  } while (previous !== source);
+  } while (
+    previous !== source
+  );
 
   return source;
 }
+
+/* =========================================================
+   STRING CONCATENATION
+========================================================= */
 
 function foldStringConcats(source) {
   let previous;
@@ -502,13 +614,15 @@ function foldStringConcats(source) {
         JSON.stringify(a + b)
     );
 
-  } while (previous !== source);
+  } while (
+    previous !== source
+  );
 
   return source;
 }
 
 /* =========================================================
-   COMMENT / FORMAT CLEANUP
+   COMMENT CLEANUP
 ========================================================= */
 
 function removeComments(source) {
@@ -532,11 +646,14 @@ function normalizeWhitespace(source) {
       line.trimEnd()
     )
     .join("\n")
-    .replace(/\n{4,}/g, "\n\n\n");
+    .replace(
+      /\n{4,}/g,
+      "\n\n\n"
+    );
 }
 
 /* =========================================================
-   VM / OBFUSCATION DETECTION
+   PROTECTION DETECTION
 ========================================================= */
 
 function detectProtection(source) {
@@ -574,12 +691,12 @@ function detectProtection(source) {
     ],
 
     [
-      "program-counter references",
+      "program counter",
       /\b(?:pc|program_counter|instruction_pointer)\b/i
     ],
 
     [
-      "state-machine references",
+      "state machine",
       /\b(?:state|state_id|next_state|dispatch)\b/i
     ],
 
@@ -589,7 +706,7 @@ function detectProtection(source) {
     ],
 
     [
-      "debug/integrity references",
+      "debug/integrity checks",
       /\bdebug\./
     ],
 
@@ -599,13 +716,13 @@ function detectProtection(source) {
     ],
 
     [
-      "bitwise library",
+      "bitwise operations",
       /\b(?:bit32|bit)\./
     ],
 
     [
       "control-flow flattening indicators",
-      /\b(?:dispatcher|state_table|jump_table)\b/i
+      /\b(?:dispatcher|state_table|jump_table|next_state)\b/i
     ]
   ];
 
@@ -648,7 +765,7 @@ function deobfuscate(source) {
   );
 
   apply(
-    "Base64 string decoding",
+    "Base64 decoding",
     decodeBase64Strings
   );
 
@@ -687,6 +804,15 @@ function deobfuscate(source) {
    RECURSIVE LOADSTRING RESOLUTION
 ========================================================= */
 
+/*
+ * IMPORTANT:
+ *
+ * We ONLY recursively fetch URLs that occur in
+ * loadstring/HttpGet patterns.
+ *
+ * A random URL inside ordinary Lua isn't followed.
+ */
+
 async function resolveRecursive(
   source,
   depth = 0,
@@ -698,25 +824,30 @@ async function resolveRecursive(
     return {
       source,
       chain: [],
-      stopped: "maximum fetch depth"
+      stopped:
+        "maximum fetch depth reached"
     };
   }
 
-  const url =
-    resolveInputURL(source);
+  const loadstringUrls =
+    extractLoadstringUrls(source);
 
-  if (!url) {
+  if (!loadstringUrls.length) {
     return {
       source,
       chain: []
     };
   }
 
+  const url =
+    loadstringUrls[0];
+
   if (visited.has(url)) {
     return {
       source,
       chain: [url],
-      stopped: "circular URL"
+      stopped:
+        "circular URL detected"
     };
   }
 
@@ -734,11 +865,14 @@ async function resolveRecursive(
 
   return {
     source: nested.source,
+
     chain: [
       url,
       ...nested.chain
     ],
-    stopped: nested.stopped
+
+    stopped:
+      nested.stopped
   };
 }
 
@@ -765,7 +899,9 @@ function analyze(source) {
       extractUrls(source),
 
     loadstrings:
-      extractLoadstringUrls(source),
+      extractLoadstringUrls(
+        source
+      ),
 
     protection:
       detectProtection(source)
@@ -795,7 +931,7 @@ client.once(
 );
 
 /* =========================================================
-   INTERACTIONS
+   COMMAND HANDLER
 ========================================================= */
 
 client.on(
@@ -807,8 +943,13 @@ client.on(
       return;
     }
 
+    /* -----------------------------------------
+       PING
+    ----------------------------------------- */
+
     if (
-      interaction.commandName === "ping"
+      interaction.commandName ===
+      "ping"
     ) {
       await interaction.reply(
         "🏓 Pong!"
@@ -816,6 +957,10 @@ client.on(
 
       return;
     }
+
+    /* -----------------------------------------
+       DEOBF
+    ----------------------------------------- */
 
     if (
       interaction.commandName !==
@@ -837,7 +982,7 @@ client.on(
     if (!input && !attachment) {
       await interaction.reply({
         content:
-          "❌ Give me Lua source, a loadstring, a raw URL, or upload a Lua file.",
+          "❌ Provide Lua source, a loadstring, a raw URL, or upload a Lua file.",
         ephemeral: true
       });
 
@@ -851,9 +996,9 @@ client.on(
       let filename =
         "deobfuscated.lua";
 
-      /* -----------------------------------------
+      /* ---------------------------------------
          FILE
-      ----------------------------------------- */
+      --------------------------------------- */
 
       if (attachment) {
         const name =
@@ -872,6 +1017,10 @@ client.on(
         filename =
           attachment.name;
 
+        console.log(
+          `[FILE] Downloading ${attachment.name}`
+        );
+
         const response =
           await fetch(
             attachment.url,
@@ -885,7 +1034,7 @@ client.on(
 
         if (!response.ok) {
           throw new Error(
-            `Discord returned HTTP ${response.status}.`
+            `Discord attachment returned HTTP ${response.status}.`
           );
         }
 
@@ -893,12 +1042,22 @@ client.on(
           await response.text();
       }
 
-      /* -----------------------------------------
-         TEXT / URL / LOADSTRING
-      ----------------------------------------- */
+      /* ---------------------------------------
+         INPUT
+      --------------------------------------- */
 
       else {
-        originalSource = input;
+        originalSource =
+          input;
+      }
+
+      if (
+        !originalSource ||
+        !originalSource.trim()
+      ) {
+        throw new Error(
+          "The supplied input is empty."
+        );
       }
 
       if (
@@ -910,49 +1069,94 @@ client.on(
         );
       }
 
-      /* -----------------------------------------
-         RESOLVE REMOTE SOURCES
-      ----------------------------------------- */
+      /* ---------------------------------------
+         DIRECT URL / LOADSTRING
+      --------------------------------------- */
 
-      const resolved =
-        await resolveRecursive(
+      const directURL =
+        resolveInputURL(
           originalSource
         );
 
-      /* -----------------------------------------
-         DEOBFUSCATE
-      ----------------------------------------- */
+      let sourceToProcess =
+        originalSource;
+
+      let sourceChain = [];
+
+      /*
+       * If input is a direct URL or contains
+       * a loadstring, resolve it.
+       */
+      if (directURL) {
+        console.log(
+          `[INPUT URL] ${directURL}`
+        );
+
+        sourceToProcess =
+          await fetchSource(
+            directURL
+          );
+
+        sourceChain.push(
+          directURL
+        );
+      }
+
+      /* ---------------------------------------
+         RECURSIVE LOADSTRING FETCHING
+      --------------------------------------- */
+
+      const resolved =
+        await resolveRecursive(
+          sourceToProcess,
+          0,
+          new Set(
+            sourceChain
+          )
+        );
+
+      sourceToProcess =
+        resolved.source;
+
+      sourceChain = [
+        ...sourceChain,
+        ...resolved.chain
+      ];
+
+      /* ---------------------------------------
+         STATIC DEOBFUSCATION
+      --------------------------------------- */
 
       const result =
         deobfuscate(
-          resolved.source
+          sourceToProcess
         );
 
-      /* -----------------------------------------
-         ANALYZE
-      ----------------------------------------- */
+      /* ---------------------------------------
+         ANALYSIS
+      --------------------------------------- */
 
       const analysis =
         analyze(
           result.source
         );
 
-      /* -----------------------------------------
-         PUBLISH
-      ----------------------------------------- */
+      /* ---------------------------------------
+         RAW OUTPUT
+      --------------------------------------- */
 
-      const rawUrl =
+      const rawURL =
         publishRaw(
           result.source,
           filename
         );
 
-      /* -----------------------------------------
+      /* ---------------------------------------
          DISCORD RESPONSE
-      ----------------------------------------- */
+      --------------------------------------- */
 
       let message =
-        "## ✅ Deobfuscation Result\n\n";
+        "## ✅ Source Processed\n\n";
 
       message +=
         `**Input:** ${originalSource.length.toLocaleString()} characters\n`;
@@ -967,7 +1171,7 @@ client.on(
         `**Functions:** ${analysis.functions.toLocaleString()}\n\n`;
 
       message +=
-        `### 🔗 Raw Output\n${rawUrl}\n\n`;
+        `### 🔗 Raw Output\n${rawURL}\n\n`;
 
       message +=
         "### 🔧 Transformations\n";
@@ -985,14 +1189,12 @@ client.on(
           "- No safe static transformations matched.";
       }
 
-      if (
-        resolved.chain.length
-      ) {
+      if (sourceChain.length) {
         message +=
-          "\n\n### 🌐 Source Chain\n";
+          "\n\n### 🌐 Loaded Sources\n";
 
         message +=
-          resolved.chain
+          sourceChain
             .map(
               url =>
                 `- ${url}`
@@ -1001,10 +1203,17 @@ client.on(
       }
 
       if (
+        resolved.stopped
+      ) {
+        message +=
+          `\n\n⚠️ ${resolved.stopped}`;
+      }
+
+      if (
         analysis.protection.length
       ) {
         message +=
-          "\n\n### 🔍 Remaining Obfuscation Indicators\n";
+          "\n\n### 🔍 Remaining Indicators\n";
 
         message +=
           analysis.protection
@@ -1019,7 +1228,7 @@ client.on(
         analysis.loadstrings.length
       ) {
         message +=
-          "\n\n### 🔗 Loadstrings\n";
+          "\n\n### 🔗 Loadstrings Found\n";
 
         message +=
           analysis.loadstrings
@@ -1031,12 +1240,13 @@ client.on(
       }
 
       /*
-       * Never exceed Discord's message limit.
+       * Discord limit.
        */
+
       if (message.length > 1900) {
         message =
           message.slice(0, 1800) +
-          "\n\n...additional information is available in the raw output.";
+          "\n\n...See the raw output URL for the complete result.";
       }
 
       await interaction.editReply(
@@ -1050,7 +1260,10 @@ client.on(
       );
 
       const errorText =
-        String(error.message || error);
+        String(
+          error.message ||
+          error
+        );
 
       await interaction.editReply(
         `❌ **Failed**\n\`\`\`\n${errorText.slice(
@@ -1081,6 +1294,16 @@ process.on(
   error => {
     console.error(
       "Unhandled rejection:",
+      error
+    );
+  }
+);
+
+process.on(
+  "uncaughtException",
+  error => {
+    console.error(
+      "Uncaught exception:",
       error
     );
   }
